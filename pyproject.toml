@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medlift3d"
+version = "0.1.0"
+description = "Volumetric lung nodule assessment from sparse-view and limited-angle chest projections"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "torch>=2.1",
+    "PyYAML>=6.0",
+    "tqdm>=4.65",
+    "scikit-image>=0.21",
+    "nibabel>=5.1",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+lidc = ["pylidc>=0.2.3", "pydicom>=2.4", "SimpleITK>=2.3"]
+dicom = ["pydicom>=2.4", "highdicom>=0.22"]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

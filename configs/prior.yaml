@@ -1,0 +1,31 @@
+# 2-D axial-slice diffusion prior. Sized for one 16 GB T4 (Kaggle).
+# A 2-D prior instead of 3-D is what makes this fit: ~7 GB and ~a day, versus
+# 16-40 GB and a week, and it removes a 3-D autoencoder from the critical path.
+
+unet:
+  base_dim: 64
+  dim_mults: [1, 2, 4, 8]
+  attn_at: [2, 3]             # attention only at coarse levels: it is O(N^2) in pixels
+  cond_ch: 1                  # aligned initialisation channel; 0 = unconditional
+  groups: 8
+  dropout: 0.0
+  # ~48M params at 256x256
+
+diffusion:
+  timesteps: 1000
+  schedule: cosine
+  objective: eps              # ALWAYS explicit. Stated here, written into every
+                              # checkpoint, and enforced on load -- see docs/CODE_AUDIT.md S2
+  loss_type: l2
+  cfg_drop_prob: 0.1          # conditioning dropout -> tunable guidance at sampling
+
+train:
+  epochs: 60
+  batch_size: 8               # ~7 GB at 256x256 with AMP on a T4
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  amp: true
+  workers: 2                  # Kaggle tolerates 2-4
+  save_every: 500             # steps
+  max_hours: 11.0             # Kaggle kills the session at 12h; stop cleanly first

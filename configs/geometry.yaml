@@ -1,0 +1,42 @@
+# Acquisition geometry. THE single source of truth: the simulator and the
+# projector both read this file, so they cannot drift apart. The FYDP-1 repo had
+# four different view counts across four files (60 / 15 / 5 / 5).
+
+grid:
+  # Paper target. Not 512^3: LIDC chest CT is 512x512x(100-400) with anisotropic
+  # spacing, so a 512^3 claim would require inventing the z resolution it
+  # purports to validate. See docs/REVIEW.md B3.
+  shape: [256, 256, 256]      # (nz, ny, nx)
+  spacing: [1.5, 1.5, 1.5]    # mm, isotropic
+
+roi:
+  shape: [128, 128, 128]
+  spacing: [1.0, 1.0, 1.0]    # 1 mm around the nodule, affordable via docs/PLAN.md 4.4
+
+# Track A -- sparse-view CT over a wide arc. PRIMARY: mildly ill-posed, directly
+# comparable to the literature, and it de-risks everything. If the pipeline
+# cannot do 32 views over 180 deg it will not do 15 over 30.
+track_a:
+  kind: parallel
+  arc_deg: 180.0
+  view_counts: [8, 16, 32, 64]
+
+# Track B -- limited-angle digital tomosynthesis. The report's original setting
+# and the hard case: a 30 deg arc leaves a 150 deg missing wedge, so depth
+# resolution is poor. Claim RELATIVE change detection with uncertainty here, not
+# absolute volumetry. See docs/REVIEW.md A4.
+track_b:
+  kind: dts
+  arc_deg: 30.0               # angle subtended at the object
+  view_counts: [15, 25]
+  src_dist: 1000.0            # source -> object centre, mm
+  det_dist: 400.0             # object centre -> detector, mm
+
+detector:
+  spacing: null               # null -> min(grid.spacing); sized to cover the grid
+
+physics:
+  # Simulate with the operator the solver optimises through. Mixing a
+  # polychromatic simulator with a monochromatic loss is showstopper S4.
+  i0: 1.0e5                   # photon count for Poisson noise; 0 disables
+  hu_clip: [-1000.0, 400.0]

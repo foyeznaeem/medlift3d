@@ -1,0 +1,35 @@
+# Two-scale ROI refinement (objective O5).
+#
+# Gaussians are an adaptive, edge-aware parameterisation of a voxel field -- NOT
+# a splat rasteriser, and they do not make rendering real-time or memory-free
+# (the dense ROI volume is materialised every iteration). Affordable only because
+# it runs on a 128^3 ROI, not a full chest. See docs/CODE_AUDIT.md, final row.
+
+roi:
+  shape: [128, 128, 128]
+  spacing: [1.0, 1.0, 1.0]
+  n_iter: 800
+  coarse_iters: 60            # shared SIRT-TV start for both ablation arms
+
+gaussians:
+  n_init: 150000
+  window: 7                   # odd; local support in voxels
+  init_scale_vox: 0.9
+  min_scale_mm: 0.15
+  max_scale_mm: 6.0
+  chunk: 8192
+  lr_xyz: 2.0e-3
+  lr_amp: 5.0e-2
+  lr_scale: 5.0e-3
+  lr_quat: 1.0e-3
+  # Regularise the PRIMITIVES, never a rasterised dense volume -- doing the
+  # latter reintroduces the cost the parameterisation exists to avoid.
+  lam_scale: 1.0e-4           # L1 on sigma: suppresses needle artefacts
+  lam_aniso: 1.0e-3           # penalise sigma_max/sigma_min: fights the Track B
+                              # missing-wedge elongation directly
+
+ablation:
+  # Deliberately falsifiable. A negative result is publishable: it means the ROI
+  # stage should be plain voxels and 3DGS belongs in the viewer, if anywhere.
+  parameterisations: [gaussian, voxel]
+  match: iterations

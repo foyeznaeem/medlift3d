@@ -1,0 +1,25 @@
+# Reconstruction: 2-D prior alternated with hard data consistency.
+
+solver:
+  n_steps: 50                 # DDIM steps, not 1000. 1000 DDPM steps buys nothing
+                              # and costs a 20-40x inference slowdown (docs/REVIEW.md C2)
+  dc_steps: 2                 # data-consistency steps per diffusion step
+  dc_step: 0.9                # relative to 1/L, L from power iteration on A^T A,
+                              # so this transfers across geometries unchanged
+  lam_z: 0.03                 # z-direction TV: the inter-slice coupling that lets a
+                              # 2-D prior produce a coherent 3-D volume
+  guidance: 0.0               # classifier-free guidance strength
+  eta: 0.0                    # DDIM stochasticity; > 0 diversifies posterior samples
+  warm_start_t: 0.7           # start partway down the schedule from CGLS, and
+                              # actually use it (FYDP-1 used only its .shape)
+  slice_batch: 16             # z-slices per prior forward pass; sets peak VRAM
+  n_posterior: 8              # K samples -> mean = reconstruction, std = uncertainty.
+                              # ~270 MB at 256^3 fp32. This is what makes invented
+                              # structure distinguishable from measured structure.
+
+baselines:
+  # A learned prior has to beat these to justify its existence.
+  fbp: {window: hann}
+  sirt: {n_iter: 60}
+  sirt_tv: {n_iter: 60, tv_weight: 2.0e-3, tv_steps: 2}
+  cgls: {n_iter: 30}          # semi-convergent: keep n_iter modest

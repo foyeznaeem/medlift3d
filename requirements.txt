@@ -1,0 +1,22 @@
+# Core. The projector is pure PyTorch, so there is no ASTRA/CuPy numpy<2 constraint.
+numpy>=1.24
+scipy>=1.10
+torch>=2.1
+PyYAML>=6.0
+tqdm>=4.65
+scikit-image>=0.21
+nibabel>=5.1
+pandas>=2.0
+matplotlib>=3.7
+
+# Optional: real LIDC-IDRI ingestion (scripts/prepare_lidc.py)
+#   pylidc>=0.2.3
+#   pydicom>=2.4
+#   SimpleITK>=2.3
+
+# Optional: DICOM SEG / SR export (medlift3d.export)
+#   pydicom>=2.4
+#   highdicom>=0.22
+
+# Optional: pytest
+#   pytest>=7.4
