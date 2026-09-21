@@ -6,7 +6,12 @@ unet:
   base_dim: 64
   dim_mults: [1, 2, 4, 8]
   attn_at: [2, 3]             # attention only at coarse levels: it is O(N^2) in pixels
-  cond_ch: 1                  # aligned initialisation channel; 0 = unconditional
+  cond_ch: 0                  # 0 = unconditional (default). Set to 1 ONLY with a
+                              # conditioning volume stored in the dataset and
+                              # passed as --cond-key: it must be something that
+                              # also exists at inference (a CGLS/FBP init).
+                              # Conditioning on the clean target teaches the net
+                              # to copy the channel and reproduces the init.
   groups: 8
   dropout: 0.0
   # ~48M params at 256x256

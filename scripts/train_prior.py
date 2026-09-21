@@ -2,9 +2,12 @@
 """Train the 2-D axial-slice diffusion prior.
 
 Built for a 12-hour Kaggle session: `--max-hours` stops cleanly before the
-notebook is killed, and a rerun resumes from `last.pt` automatically. Losing a
-run to a session timeout is what the FYDP-1 debug log records happening
-repeatedly; here it costs nothing.
+notebook is killed, and a rerun resumes from `last.pt` automatically.
+
+The prior is unconditional unless `--cond-key` names a conditioning volume
+stored in the dataset. That volume must be one that also exists at inference (a
+CGLS or FBP initialisation) -- never the clean target, which would train the
+network to copy its conditioning channel.
 
     python scripts/train_prior.py --data data/phantom --out runs/prior --max-hours 11
 """
@@ -41,11 +44,12 @@ def validate(diff, loader, device, n_batches=None, seed=1234):
         if n_batches and i >= n_batches:
             break
         x = batch["x"].to(device)
+        cond = batch["cond"].to(device) if "cond" in batch else None
         g = torch.Generator(device="cpu").manual_seed(seed + i)
         t = torch.randint(0, diff.cfg.timesteps, (x.shape[0],), generator=g).to(device)
         noise = torch.randn(x.shape, generator=g).to(device)
         x_t = diff.q_sample(x, t, noise)
-        pred = diff.model(x_t, t, x if diff.model.cfg.cond_ch else None)
+        pred = diff.model(x_t, t, cond)
         target = noise if diff.cfg.objective == "eps" else x
         tot += float(torch.nn.functional.mse_loss(pred, target).detach()) * x.shape[0]
         n += x.shape[0]
@@ -67,9 +71,11 @@ def main():
     ap.add_argument("--timesteps", type=int, default=1000)
     ap.add_argument("--objective", default="eps", choices=["eps", "x0"])
     ap.add_argument("--cfg-drop", type=float, default=0.1)
-    ap.add_argument("--no-cond", action="store_true",
-                    help="train an unconditional prior (data consistency then "
-                         "supplies all patient specificity)")
+    ap.add_argument("--cond-key", default=None,
+                    help="name of a conditioning volume stored in each case "
+                         "(e.g. a CGLS initialisation). Omit for an "
+                         "unconditional prior, which is the default: data "
+                         "consistency then supplies all patient specificity.")
     ap.add_argument("--amp", action="store_true", default=None)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--max-hours", type=float, default=None,
@@ -87,9 +93,11 @@ def main():
 
     split = load_split(args.data / "splits.csv")
     verify_split(split)           # leakage is checked, never assumed
-    tr = SliceDataset(args.data, split["train"])
-    va = SliceDataset(args.data, split["val"])
-    print(f"device={device} amp={use_amp}  train slices={len(tr)}  val slices={len(va)}")
+    tr = SliceDataset(args.data, split["train"], cond_key=args.cond_key)
+    va = SliceDataset(args.data, split["val"], cond_key=args.cond_key)
+    cache_gb = (tr.cache_bytes + va.cache_bytes) / 2 ** 30
+    print(f"device={device} amp={use_amp}  train slices={len(tr)}  val slices={len(va)}"
+          + (f"  slice cache {cache_gb:.2f} GB" if cache_gb else "  (uncached)"))
     print(f"train cases={len(split['train'])} val={len(split['val'])} "
           f"test={len(split['test'])} (test never seen by the prior)")
 
@@ -100,7 +108,7 @@ def main():
                        num_workers=args.workers, persistent_workers=args.workers > 0)
 
     ucfg = UNetConfig(base_dim=args.base_dim, dim_mults=tuple(args.dim_mults),
-                      cond_ch=0 if args.no_cond else 1)
+                      cond_ch=1 if args.cond_key else 0)
     dcfg = DiffusionConfig(timesteps=args.timesteps, objective=args.objective,
                            cfg_drop_prob=args.cfg_drop)
     diff = GaussianDiffusion(UNet2D(ucfg), dcfg).to(device)
@@ -135,10 +143,10 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         diff.train()
         bar = tqdm(dl_tr, desc=f"epoch {epoch+1}/{args.epochs}")
-        run = 0.0
-        for i, batch in enumerate(bar):
+        run, seen = 0.0, 0
+        for batch in bar:
             x = batch["x"].to(device, non_blocking=True)
-            cond = None if args.no_cond else x
+            cond = batch["cond"].to(device, non_blocking=True) if "cond" in batch else None
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type, enabled=use_amp):
                 loss = diff.loss(x, cond)
@@ -149,8 +157,9 @@ def main():
             scaler.update()
 
             step += 1
+            seen += 1
             run += float(loss.detach())
-            bar.set_postfix(loss=f"{run/(i+1):.4f}", step=step)
+            bar.set_postfix(loss=f"{run/seen:.4f}", step=step)
             if step % args.save_every == 0:
                 checkpoint(epoch)
             if args.max_hours and (time.time() - t_start) / 3600 > args.max_hours:
@@ -159,8 +168,9 @@ def main():
                 break
 
         vloss = validate(diff, dl_va, device, n_batches=40)
-        log.log(epoch=epoch + 1, step=step, train_loss=run / max(1, i + 1), val_loss=vloss)
-        print(f"epoch {epoch+1}: train {run/max(1,i+1):.5f}  val {vloss:.5f}")
+        tloss = run / max(1, seen)
+        log.log(epoch=epoch + 1, step=step, train_loss=tloss, val_loss=vloss)
+        print(f"epoch {epoch+1}: train {tloss:.5f}  val {vloss:.5f}")
 
         if vloss < best:
             best = vloss

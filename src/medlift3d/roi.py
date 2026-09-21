@@ -13,7 +13,7 @@ The decomposition is **exact**, because `A` is linear:
 
 where `mu_bg` is the coarse reconstruction with the ROI box zeroed and `mu_roi`
 lives on the fine grid. Fitting `A_roi(mu_roi) ~ r` therefore introduces no
-approximation beyond the resampling of the background at the box boundary --
+approximation beyond resampling the background at the box boundary.
 `tests/test_roi_exact.py` asserts the exact same-grid case and measures the
 fine-grid resampling error rather than assuming it away.
 """
@@ -78,9 +78,8 @@ def refine_roi(projs: torch.Tensor, mu_chest: torch.Tensor,
     """Refine a fine-grid ROI against the background-subtracted residual.
 
     `use_gaussians=False` runs the identical optimisation on a plain voxel grid.
-    That is not a fallback -- it is the control arm for the O5 ablation, which
-    asks whether the Gaussian parameterisation earns its place at equal compute.
-    Run both and report the answer either way.
+    It is not a fallback but the control arm for the O5 ablation: same residual,
+    same iteration count, different parameterisation.
     """
     device = chest_projector.device
     chest = chest_projector.grid
@@ -120,7 +119,7 @@ def refine_roi(projs: torch.Tensor, mu_chest: torch.Tensor,
         loss.backward()
         opt.step()
         if use_gaussians and (it + 1) % 200 == 0:
-            field.prune()
+            field.prune(optimizer=opt)
         if (it + 1) % max(1, n_iter // 10) == 0:
             history.append({"iter": it + 1, "data": float(data.detach()),
                              "loss": float(loss.detach())})

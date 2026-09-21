@@ -2,7 +2,7 @@
 
 Structure follows DiffusionMBIR (Chung et al., CVPR 2023): a purely 2-D slice
 prior supplies anatomy, the measurement operator supplies patient specificity,
-and a z-direction TV term supplies inter-slice coherence. This is what lets the
+and a z-direction TV term supplies inter-slice coherence. That is what lets the
 whole thing fit on one 16 GB card.
 
 Each reverse-diffusion step is:
@@ -14,22 +14,20 @@ Each reverse-diffusion step is:
     x0   <- clamp(x0, physical range)
     x_t-1 <- ddim(x_t, x0, eps)
 
-Two properties matter and neither was true of the FYDP-1 pipeline:
+Two properties make the data term real rather than decorative:
 
-* The data term has a real gradient. `Projector.bp` is the exact adjoint of
-  `Projector.fp`, verified by `tests/test_adjoint.py`, so `A^T(A x0 - p)` is the
-  true gradient of `0.5||A x0 - p||^2`. Without that, the projection loss is a
-  constant and the only live gradient is the regulariser -- which converges very
-  stably to smooth mush.
-* The step size is derived, not guessed. `lr = dc_step / L` where `L` is the
-  largest eigenvalue of `A^T A` from power iteration, so the same `dc_step`
-  behaves consistently across grid sizes, view counts and geometries.
+* `Projector.bp` is the exact adjoint of `Projector.fp` (asserted by
+  `tests/test_adjoint.py`), so `A^T(A x0 - p)` is the true gradient of
+  `0.5||A x0 - p||^2`. Without that the projection loss is a constant and the
+  regulariser is the whole objective, which converges very stably to mush.
+* The step size is derived, not guessed. `L` is the largest eigenvalue of
+  `A^T A` from power iteration, so one `dc_step` behaves consistently across
+  grid sizes, view counts and geometries.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, replace
 
-import numpy as np
 import torch
 from tqdm.auto import tqdm
 
@@ -50,7 +48,8 @@ class SolverConfig:
     slice_batch: int = 16          # z-slices per prior forward pass
     n_posterior: int = 8           # K posterior samples -> mean + per-voxel std
     warm_start_t: float = 0.7      # begin at this fraction of the schedule
-    use_cond: bool = True          # feed the aligned initialisation as a channel
+    use_cond: bool = True          # feed the initialisation as a channel, if the
+                                   # prior was trained with one
     mu_max: float = MU_MAX
     progress: bool = True
 
@@ -87,6 +86,14 @@ class DiffusionSolver:
         self.device = projector.device
         self.L = lipschitz if lipschitz is not None else estimate_lipschitz(projector)
 
+        # The prior decides whether conditioning exists; the solver may only
+        # decline it. Handing a cond channel to a network that never had one is
+        # silent, so take the answer from the checkpoint rather than the config.
+        model_cfg = getattr(getattr(diffusion, "model", None), "cfg", None)
+        self.cond_ch = int(getattr(model_cfg, "cond_ch", 0))
+        if self.cfg.use_cond and not self.cond_ch:
+            self.cfg = replace(self.cfg, use_cond=False)
+
     # -- the prior, applied slicewise -----------------------------------------
 
     @torch.no_grad()
@@ -109,13 +116,21 @@ class DiffusionSolver:
     # -- data consistency ------------------------------------------------------
 
     def _data_consistency(self, x0_net: torch.Tensor, projs: torch.Tensor):
-        """Gradient steps on 0.5||A mu - p||^2 + lam_z * TV_z, in network units."""
-        lr = self.cfg.dc_step / max(self.L, 1e-12)
+        """Gradient steps on 0.5||A mu - p||^2 + lam_z * TV_z, in network units.
+
+        The chain rule has to be applied to the step size as well as to the
+        gradient. With `mu = c * x + const` and `c = MU_MAX / 2`, the objective's
+        Hessian in network units is `c^2 A^T A`, so the stable step is
+        `dc_step / (c^2 L)` -- not `dc_step / L`. Using the latter under-relaxes
+        by 1/c^2 ~ 5500x, which leaves the data term visibly present in the code
+        and inert in effect: 100 steps then cut the projection residual by ~1%
+        where a correctly scaled step cuts it by ~99%.
+        """
+        c = self.cfg.mu_max / 2.0
+        lr = self.cfg.dc_step / max(self.L * c * c, 1e-12)
         x = x0_net
         for _ in range(self.cfg.dc_steps):
-            mu = net_to_mu(x)
-            # d/dx = d/dmu * dmu/dx, and dmu/dx = MU_MAX/2.
-            g = self.projector.bp(self.projector.fp(mu) - projs) * (self.cfg.mu_max / 2.0)
+            g = self.projector.bp(self.projector.fp(net_to_mu(x)) - projs) * c
             if self.cfg.lam_z > 0:
                 gz = tv_grad_z(x, axis=0)
                 scale = g.abs().mean().clamp_min(1e-12) / gz.abs().mean().clamp_min(1e-12)
@@ -137,9 +152,7 @@ class DiffusionSolver:
 
         steps = d.ddim_timesteps(cfg.n_steps)
         # Warm start: begin partway down the schedule from the classical
-        # reconstruction rather than from pure noise. Unlike the FYDP-1 code,
-        # which computed an initialisation and then used only its `.shape`, this
-        # actually seeds the trajectory.
+        # reconstruction rather than from pure noise.
         t_start = int(cfg.warm_start_t * (d.cfg.timesteps - 1))
         steps = [s for s in steps if s <= t_start] or [steps[-1]]
 
@@ -148,6 +161,7 @@ class DiffusionSolver:
         t0 = torch.full((1,), steps[0], device=self.device, dtype=torch.long)
         x = d.q_sample(mu_to_net(init_mu).clamp(-1, 1)[None], t0, noise[None])[0]
 
+        x0 = x
         bar = tqdm(range(len(steps)), desc="solve", disable=not progress, leave=False)
         for i in bar:
             t_cur = steps[i]
@@ -174,9 +188,9 @@ class DiffusionSolver:
         """K posterior samples -> mean reconstruction plus per-voxel uncertainty.
 
         The mean is the reconstruction; the standard deviation is the uncertainty
-        map the report's abstract promises. It is close to free: K samples at
-        256^3 in float32 is ~270 MB, and it is the only thing that lets a reader
-        tell measured structure from structure the prior invented.
+        map. It is close to free (K samples at 256^3 fp32 is ~270 MB) and it is
+        the only thing that lets a reader tell measured structure from structure
+        the prior invented.
         """
         k = n_posterior if n_posterior is not None else self.cfg.n_posterior
         projs = projs.to(self.device, self.projector.dtype)

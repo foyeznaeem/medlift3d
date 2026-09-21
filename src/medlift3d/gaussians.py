@@ -1,24 +1,20 @@
 """Anisotropic Gaussian parameterisation of attenuation, for ROI refinement.
 
-Be precise about what this is and is not. It is an **adaptive,
-edge-aware parameterisation of a voxel field**: Gaussians are evaluated onto the
-ROI grid and the resulting volume is line-integrated by the ordinary projector,
-so the physics is the projector's and is identical to every other stage. It is
-*not* a splat rasteriser, and it does not make rendering "real-time" or memory
-free -- the dense ROI volume is materialised on every iteration. Justifying
-Gaussians on efficiency grounds, as the FYDP-1 report did, is not supportable;
-justifying them as a compact adaptive basis is, and whether that actually helps
-is what the O5 ablation is for.
+This is an **adaptive, edge-aware parameterisation of a voxel field**: Gaussians
+are evaluated onto the ROI grid and the resulting volume is line-integrated by
+the ordinary projector, so the physics is identical to every other stage. It is
+*not* a splat rasteriser and it does not make rendering free -- the dense ROI
+volume is materialised on every iteration. The claim it can support is that
+Gaussians are a compact adaptive basis; whether that helps is what the O5
+ablation measures. It is affordable only on a 128^3 ROI (~8 MB), never on a
+whole chest.
 
-It is affordable only because it runs on a 128^3 ROI (~8 MB) rather than a full
-chest (a 512x512x184 sampling grid is ~578 MB before anything else).
-
-Two corrections to the FYDP-1 formulation:
+Two invariants:
   * amplitude uses `softplus`, so attenuation is non-negative and **unbounded**.
-    A sigmoid caps mu at 1.0 mm^-1 and saturates its own gradient.
-  * regularisation acts on the **primitives** (scale, anisotropy), not on a
-    rasterised dense volume -- regularising the dense volume would reintroduce
-    the very cost the parameterisation is meant to avoid.
+    A sigmoid would cap mu at 1.0 mm^-1 and saturate its own gradient.
+  * regularisation acts on the **primitives** (scale, anisotropy), never on a
+    rasterised dense volume -- that would reintroduce the cost the
+    parameterisation exists to avoid.
 """
 from __future__ import annotations
 
@@ -50,6 +46,14 @@ class GaussianConfig:
 
     def to_dict(self):
         return asdict(self)
+
+
+_PARAM_NAMES = ("xyz", "raw_amp", "log_scale", "quat")
+
+
+def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
+    """Inverse of `softplus`, so an amplitude can be set to an exact value."""
+    return torch.log(torch.expm1(y.clamp_min(1e-6)).clamp_min(1e-12))
 
 
 def quat_to_rot(q: torch.Tensor) -> torch.Tensor:
@@ -129,7 +133,8 @@ class GaussianField(nn.Module):
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
         n = min(n, int((flat > 0).sum()))
-        idx = torch.multinomial(flat.cpu() / flat.cpu().sum(), n, replacement=False,
+        probs = flat.detach().cpu()
+        idx = torch.multinomial(probs / probs.sum(), n, replacement=False,
                                 generator=gen).to(self.device)
 
         nz, ny, nx = self.grid.shape
@@ -146,7 +151,7 @@ class GaussianField(nn.Module):
         q0[:, 0] = 1.0
 
         # Invert softplus so the initial amplitude reproduces the sampled value.
-        raw = torch.log(torch.expm1(vals.clamp_min(1e-6)).clamp_min(1e-12))
+        raw = _inv_softplus(vals)
 
         self.xyz = nn.Parameter(xyz)
         self.raw_amp = nn.Parameter(raw)
@@ -172,8 +177,7 @@ class GaussianField(nn.Module):
             return 1.0
         alpha = float((r * mu.to(r.device, r.dtype)).sum() / denom)
         alpha = max(alpha, 1e-6)
-        new_amp = (self.amp * alpha).clamp_min(1e-8)
-        self.raw_amp.data = torch.log(torch.expm1(new_amp).clamp_min(1e-12))
+        self.raw_amp.data = _inv_softplus(self.amp * alpha)
         return alpha
 
     # -- rasterisation ----------------------------------------------------------
@@ -219,7 +223,7 @@ class GaussianField(nn.Module):
         if self.n == 0:
             return torch.zeros((), device=self.device, dtype=self.dtype)
         s = self.scale
-        l_scale = s.abs().mean()
+        l_scale = s.mean()
         aniso = (s.amax(-1) / s.amin(-1).clamp_min(1e-8) - 1.0).clamp_min(0.0).mean()
         return self.cfg.lam_scale * l_scale + self.cfg.lam_aniso * aniso
 
@@ -235,20 +239,39 @@ class GaussianField(nn.Module):
         ], eps=1e-15)
 
     @torch.no_grad()
-    def prune(self, min_amp: float = 1e-4) -> int:
-        """Drop primitives that contribute nothing. Returns the number removed."""
+    def prune(self, min_amp: float = 1e-4, optimizer=None) -> int:
+        """Drop primitives that contribute nothing. Returns the number removed.
+
+        Pruning replaces every `Parameter`, which orphans an optimizer that is
+        already holding the old tensors: it goes on stepping detached buffers
+        while the live parameters never move again. Pass the optimizer and its
+        param groups and per-parameter state are re-bound and sliced to match.
+        """
         if self.n == 0:
             return 0
         keep = self.amp > min_amp
         removed = int((~keep).sum())
-        if removed:
-            self.xyz = nn.Parameter(self.xyz.data[keep])
-            self.raw_amp = nn.Parameter(self.raw_amp.data[keep])
-            self.log_scale = nn.Parameter(self.log_scale.data[keep])
-            self.quat = nn.Parameter(self.quat.data[keep])
+        if not removed:
+            return 0
+        old = {name: getattr(self, name) for name in _PARAM_NAMES}
+        for name, p in old.items():
+            setattr(self, name, nn.Parameter(p.data[keep]))
+        if optimizer is not None:
+            self._rebind(optimizer, old, keep)
         return removed
 
-    def state(self) -> dict:
-        return {"xyz": self.xyz.detach().cpu(), "raw_amp": self.raw_amp.detach().cpu(),
-                "log_scale": self.log_scale.detach().cpu(), "quat": self.quat.detach().cpu(),
-                "cfg": self.cfg.to_dict(), "grid": self.grid.as_dict()}
+    def _rebind(self, optimizer, old, keep) -> None:
+        """Point `optimizer` at the new Parameters, carrying its state across."""
+        new_for = {id(p): getattr(self, name) for name, p in old.items()}
+        for group in optimizer.param_groups:
+            for i, p in enumerate(group["params"]):
+                new = new_for.get(id(p))
+                if new is None:
+                    continue
+                state = optimizer.state.pop(p, None)
+                if state is not None:
+                    # Slice the per-primitive moments; leave scalars (step) alone.
+                    optimizer.state[new] = {
+                        k: v[keep] if torch.is_tensor(v) and v.shape == p.shape else v
+                        for k, v in state.items()}
+                group["params"][i] = new

@@ -19,12 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np
 import pandas as pd
-import torch
 from tqdm.auto import tqdm
 
 from medlift3d.datasets import default_dirs, load_case
 from medlift3d.geometry import Grid
-from medlift3d.metrics import calibration, global_metrics, nodule_metrics
+from medlift3d.metrics import global_metrics, nodule_metrics
 from medlift3d.phantom import lung_mask
 
 
@@ -72,7 +71,7 @@ def main():
 
             lung = lung_mask(gt, grid)
             row = {"method": mdir.name, "case_id": cid,
-                   **global_metrics(mu, gt, grid, lung)}
+                   **global_metrics(mu, gt, lung)}
             if std is not None:
                 row["mean_uncertainty"] = float(std[lung].mean()) if lung.any() else float(std.mean())
             rows.append(row)

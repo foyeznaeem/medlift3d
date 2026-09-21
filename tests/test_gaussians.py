@@ -1,5 +1,4 @@
 """The Gaussian ROI parameterisation: correctness and the two FYDP-1 fixes."""
-import numpy as np
 import pytest
 import torch
 
@@ -84,3 +83,28 @@ def test_prune_removes_dead_primitives(field):
     g.raw_amp.data[:100] = -30.0       # softplus -> ~0
     assert g.prune(min_amp=1e-4) >= 100
     assert g.n < n0
+
+
+def test_prune_keeps_the_optimizer_alive(field):
+    """Pruning replaces every Parameter, which orphans an optimizer holding the
+    old tensors: it goes on stepping detached buffers while the live parameters
+    never move again. Silent, and it freezes the Gaussian arm of the O5 ablation
+    a quarter of the way through -- rigging the comparison against it."""
+    grid, mu, _ = field
+    g = GaussianField(grid, GaussianConfig(n_init=400, window=5)).init_from_volume(mu)
+    opt = g.make_optimizer()
+
+    def step():
+        opt.zero_grad(set_to_none=True)
+        ((g.rasterize() - mu).pow(2).mean() * 1e4 + g.regularisation()).backward()
+        opt.step()
+
+    step()
+    g.raw_amp.data[:100] = -30.0
+    assert g.prune(min_amp=1e-4, optimizer=opt) >= 100
+    assert opt.param_groups[0]["params"][0] is g.xyz, "optimizer holds a stale tensor"
+
+    before = g.xyz.detach().clone()
+    step()
+    moved = float((g.xyz.detach() - before).abs().max())
+    assert moved > 0, "parameters stopped moving after prune"

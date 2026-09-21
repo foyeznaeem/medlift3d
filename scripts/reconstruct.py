@@ -8,8 +8,8 @@
         --prior runs/prior/best.pt --n-posterior 8
 
 Every method writes to the same layout so `evaluate.py` can compare them without
-special cases. Reconstructions live on the case's own grid, always -- comparing
-volumes on different grids is how the FYDP-1 numbers became meaningless.
+special cases. Reconstructions live on the case's own grid, always: comparing
+volumes on different grids makes every metric between them meaningless.
 """
 from __future__ import annotations
 

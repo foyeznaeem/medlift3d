@@ -145,14 +145,14 @@ def test_adaptive_threshold_recovers_half_occupancy():
 def test_global_metrics_identity_and_ordering(phantom):
     grid, mu, mask, meta = phantom
     lung = lung_mask(mu, grid)
-    ident = global_metrics(mu, mu, grid, lung)
+    ident = global_metrics(mu, mu, lung)
     assert ident["ssim"] == pytest.approx(1.0, abs=1e-6)
     assert np.isinf(ident["psnr"])
     rng = np.random.default_rng(0)
     worse = global_metrics(mu + rng.normal(0, 0.002, mu.shape).astype(np.float32),
-                           mu, grid, lung)
+                           mu, lung)
     better = global_metrics(mu + rng.normal(0, 0.0005, mu.shape).astype(np.float32),
-                            mu, grid, lung)
+                            mu, lung)
     assert better["psnr_lung"] > worse["psnr_lung"]
     assert better["ssim_lung"] > worse["ssim_lung"]
 

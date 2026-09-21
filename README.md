@@ -46,8 +46,9 @@ curves and wrong reconstructions. Each is a test, not a judgement call:
 | **G4** `test_metrics` | a *perfect* reconstruction scores perfectly | metrics that cannot detect anything |
 
 Plus: no data leakage, diffusion train/sample config agreement, ROI decomposition
-exactness, Gaussian field correctness. `python scripts/run_gates.py` runs all
-eight suites. **Do not start training until every gate passes.**
+exactness, Gaussian field correctness, and that data consistency measurably
+drives the projection residual down. `python scripts/run_gates.py` runs all nine
+suites. **Do not start training until every gate passes.**
 
 ## How it works
 
@@ -154,7 +155,7 @@ scripts/          run_gates · make_phantoms · prepare_lidc · train_prior ·
                   reconstruct · evaluate · mdvc · hallucination · ablate_roi
 configs/          geometry · prior · solver · roi   (geometry.yaml is the single
                   source of truth for acquisition)
-tests/            the eight gate suites
+tests/            the nine gate suites
 docs/             REVIEW · CODE_AUDIT · PLAN · IMPLEMENTATION
 ```
 

@@ -5,8 +5,7 @@ Two rules drive this module.
 1. **Nodule metrics are computed inside a dilated bounding box, never over the
    whole volume.** Thresholding a whole chest at a soft-tissue level selects the
    body wall, the spine and every vessel, so a whole-volume Dice against a
-   few-hundred-voxel nodule mask is structurally pinned near zero and carries no
-   information.
+   few-hundred-voxel nodule mask is pinned near zero regardless of quality.
 
 2. **PSNR/SSIM are restricted to the lung mask.** Whole-image PSNR on a chest CT
    is dominated by air, which every method reconstructs perfectly, so it flatters
@@ -19,7 +18,7 @@ from scipy import ndimage
 from skimage.metrics import structural_similarity
 
 from .geometry import Grid
-from .units import MU_MAX, NODULE_MU_THRESHOLD
+from .units import MU_MAX, NODULE_MU_THRESHOLD, mu_to_hu
 
 
 # ----------------------------------------------------------------------------
@@ -142,13 +141,12 @@ def ssim3d(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray | None = None,
 
 
 def mae_hu(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray | None = None) -> float:
-    from .units import mu_to_hu
     if mask is not None:
         pred, gt = pred[mask], gt[mask]
     return float(np.mean(np.abs(mu_to_hu(pred) - mu_to_hu(gt))))
 
 
-def global_metrics(pred, gt, grid: Grid, lung: np.ndarray | None = None) -> dict:
+def global_metrics(pred, gt, lung: np.ndarray | None = None) -> dict:
     out = {
         "psnr": psnr(pred, gt),
         "ssim": ssim3d(pred, gt),
@@ -246,14 +244,13 @@ def measure_nodule_volume(pred_mu: np.ndarray, centre_xyz, grid: Grid,
                           max_diameter_mm: float = 40.0,
                           threshold: float | None = None,
                           region: np.ndarray | None = None,
-                          seed_radius_mm: float = 3.0,
-                          require_detection: bool = True) -> float:
+                          seed_radius_mm: float = 3.0) -> float:
     """Volume in mm^3 of the nodule at `centre_xyz`, using no ground truth.
 
     Used by the minimum-detectable-volume-change experiment, where the identical
     measurement must be applied to a baseline and a follow-up reconstruction.
 
-    Three constraints keep this well-posed, and each was a bug first.
+    Three constraints keep this well-posed.
 
     * **Detection and measurement need different thresholds.** Adaptive
       thresholding presupposes a nodule is present; on pure parenchyma its
@@ -261,14 +258,14 @@ def measure_nodule_volume(pred_mu: np.ndarray, centre_xyz, grid: Grid,
       nothing into something. Gate on the fixed clinical threshold, then measure
       adaptively. Returns 0.0 when nothing is detected.
     * **A geometric bound.** At a fixed soft-tissue threshold a nodule near the
-      pleura is connected to the chest wall, so the component containing the
-      seed can be the whole body. Candidates are confined to a ball of
-      `max_diameter_mm / 2`: by definition a pulmonary nodule is <= 30 mm
+      pleura connects to the chest wall, so the component containing the seed
+      can be the whole body. Candidates are confined to a ball of
+      `max_diameter_mm / 2`: a pulmonary nodule is <= 30 mm by definition
       (larger is a mass), so the measurement cannot run away.
     * **An optional anatomical bound**, `region` -- normally a hole-filled lung
-      mask. This severs the connection to the chest wall properly rather than
-      merely bounding it. Pass the mask derived from the ground-truth anatomy:
-      it is an anatomical region of interest, not the answer being measured.
+      mask. This severs the connection to the chest wall rather than merely
+      bounding it. It is an anatomical region of interest, not the answer being
+      measured, so deriving it from ground-truth anatomy is legitimate.
 
     A fourth constraint: the selected component must actually touch the seed.
     Without it, erasing a nodule and re-measuring returns the volume of whatever
@@ -305,10 +302,8 @@ def hallucinated_at(pred_mu: np.ndarray, centre_xyz, grid: Grid,
     """Did a nodule-like blob appear where the ground truth has none?
 
     Run on a reconstruction whose nodule was erased from the ground truth
-    (`phantom.erase_nodule`). A blob found here is invented by the prior, and
-    the rate over a test set is the false-positive nodule rate -- the number a
-    clinician cares about, given the 96% LDCT false-positive rate this project
-    is motivated by.
+    (`phantom.erase_nodule`). A blob found here was invented by the prior, and
+    the rate over a test set is the false-positive nodule rate.
 
     Detection uses the FIXED clinical threshold, never the adaptive one: this is
     a detection question, and parenchyma at -820 HU does not cross -300 HU. The

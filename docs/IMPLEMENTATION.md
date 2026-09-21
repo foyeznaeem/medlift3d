@@ -384,7 +384,7 @@ Beyond `PLAN.md §12`:
     wrapped in a `torch.autograd.Function` whose backward is the adjoint back-projection.
     The FYDP-1 code did not do this, which is `CODE_AUDIT.md` S1.
 21. **Add a "Verification and Testing" section** (replacing §4.2.3's `NameError` anecdote)
-    listing the eight gate tests in §7. This is the strongest available evidence of
+    listing the nine gate tests in §7. This is the strongest available evidence of
     engineering rigour, and it maps directly onto Table 5.6's P3 (Depth of Analysis).
 22. **Acknowledgements / §2.2 — cite 3DGR-CT, MedSyn, and ChestXSim in the report itself,
     not only in the code README.** `gaussian_model.py`, `gs_utils/`, and the BiFlowNet

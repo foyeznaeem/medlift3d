@@ -1,9 +1,8 @@
 """Export reconstructions for clinical tooling.
 
 NIfTI always. DICOM SEG + SR when `pydicom`/`highdicom` are available: a nodule
-mask plus its volume measurement in a standard object is real interoperability,
-which is what the report's compliance section claims but the FYDP-1 code did not
-deliver (it produced only `.nii.gz`).
+mask plus its volume measurement in a standard object is what makes the output
+usable by clinical tooling rather than only by this repo.
 """
 from __future__ import annotations
 
@@ -13,6 +12,7 @@ import numpy as np
 
 from .geometry import Grid
 from .units import mu_to_hu
+from .utils import write_json
 
 
 def save_nifti(path, volume: np.ndarray, grid: Grid, as_hu: bool = True) -> Path:
@@ -87,7 +87,6 @@ def write_measurement_report(path, records: list[dict], grid: Grid) -> Path:
     Written unconditionally so the numbers are always available even when
     `highdicom` is absent.
     """
-    from .utils import write_json
     write_json(path, {"grid": grid.as_dict(),
                       "voxel_volume_mm3": grid.voxel_volume_mm3,
                       "measurements": records})

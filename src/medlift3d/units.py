@@ -29,9 +29,12 @@ NODULE_HU_THRESHOLD: float = -300.0
 
 
 def hu_to_mu(hu):
-    """HU -> linear attenuation (mm^-1). Clipped to HU_CLIP, so mu >= 0."""
-    hu = np.clip(hu, *HU_CLIP) if isinstance(hu, np.ndarray) else max(min(hu, HU_CLIP[1]), HU_CLIP[0])
-    return MU_WATER * (1.0 + hu / 1000.0)
+    """HU -> linear attenuation (mm^-1). Clipped to HU_CLIP, so mu >= 0.
+
+    `np.clip` handles scalars, lists and arrays alike; branching on
+    `isinstance(hu, np.ndarray)` silently failed on everything else.
+    """
+    return MU_WATER * (1.0 + np.clip(hu, *HU_CLIP) / 1000.0)
 
 
 def mu_to_hu(mu):
@@ -58,11 +61,10 @@ def apply_poisson(projections, i0: float = 1e5, rng=None):
 # ---------------------------------------------------------------------------
 # network normalisation
 # ---------------------------------------------------------------------------
-# Networks see mu mapped onto [-1, 1]. This is a *physical* rescaling, not an
-# arbitrary one: mu is bounded below by 0 (air) and above by MU_MAX (the top of
-# the diagnostic HU window), so clamping a network output to [-1, 1] is exactly
-# clamping mu to its physical range. That is what makes the clamp legitimate
-# here -- clamping an unregularised latent with no known range is not.
+# Networks see mu mapped onto [-1, 1]. This is a *physical* rescaling: mu is
+# bounded below by 0 (air) and above by MU_MAX (the top of the diagnostic HU
+# window), so clamping a network output to [-1, 1] is exactly clamping mu to its
+# physical range. Clamping an unregularised latent with no known range is not.
 
 def mu_to_net(mu):
     return mu / MU_MAX * 2.0 - 1.0

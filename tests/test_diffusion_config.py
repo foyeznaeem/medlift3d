@@ -1,13 +1,18 @@
-"""Regression test for showstopper S2.
+"""Train/sample agreement: objective, schedule and conditioning.
 
-FYDP-1 trained with `objective='pred_noise'` and sampled with the constructor
-default `objective='pred_x0'`, so the sampler fed noise into the slot where the
-clean signal belonged, 1000 times per reconstruction, silently.
+Two mismatches in this family are silent and ruin a whole training run. The
+objective one (train on eps, sample as x0) is caught by refusing a checkpoint
+whose config differs. The conditioning one -- training on the clean target while
+sampling on a blurry initialisation -- is caught by making the clean target
+unreachable as a conditioning source and defaulting the prior to unconditional.
 """
+import numpy as np
 import pytest
 import torch
 
+from medlift3d.datasets import SliceDataset, save_case
 from medlift3d.diffusion import DiffusionConfig, GaussianDiffusion
+from medlift3d.geometry import Grid
 from medlift3d.prior2d import UNet2D, UNetConfig
 
 
@@ -73,3 +78,45 @@ def test_ddim_timesteps_are_descending_and_unique():
     ts = d.ddim_timesteps(20)
     assert ts == sorted(set(ts), reverse=True)
     assert len(ts) <= 20 and ts[0] < 100
+
+
+def test_prior_is_unconditional_by_default():
+    """Conditioning must be opted into, with something that exists at inference.
+
+    The default used to be `cond_ch=1`, and the trainer filled that channel with
+    the clean slice while the solver filled it with a blurry CGLS volume. The
+    network learns to copy the channel, training loss looks excellent, and at
+    inference it reproduces CGLS.
+    """
+    assert UNetConfig().cond_ch == 0
+    net = UNet2D(UNetConfig(base_dim=8, dim_mults=(1, 2)))
+    assert net.cfg.cond_ch == 0
+    out = net(torch.randn(2, 1, 16, 16), torch.tensor([3, 7]))
+    assert out.shape == (2, 1, 16, 16)
+
+
+def _write_case(path, cond=None):
+    grid = Grid.centred((4, 8, 8), (1.0, 1.0, 1.0))
+    mu = np.full(grid.shape, 0.02, dtype=np.float32)
+    save_case(path, mu, grid, conditioning=cond)
+
+
+def test_slice_dataset_is_unconditional_unless_asked(tmp_path):
+    _write_case(tmp_path / "c0.npz")
+    assert "cond" not in SliceDataset(tmp_path)[0]
+
+
+def test_slice_dataset_refuses_a_missing_conditioning_volume(tmp_path):
+    """Better a loud KeyError than a silent fallback to the clean target."""
+    _write_case(tmp_path / "c0.npz")
+    with pytest.raises(KeyError, match="cond_cgls"):
+        SliceDataset(tmp_path, cond_key="cgls")
+
+
+def test_slice_dataset_serves_a_stored_conditioning_volume(tmp_path):
+    grid = Grid.centred((4, 8, 8), (1.0, 1.0, 1.0))
+    init = np.full(grid.shape, 0.01, dtype=np.float32)
+    _write_case(tmp_path / "c0.npz", cond={"cgls": init})
+    item = SliceDataset(tmp_path, cond_key="cgls")[0]
+    assert item["cond"].shape == item["x"].shape
+    assert not torch.equal(item["cond"], item["x"]), "conditioning must not be the target"

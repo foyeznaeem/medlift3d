@@ -6,8 +6,7 @@
 Under sparse or limited-angle acquisition the reconstruction is
 under-determined, so a learned prior *must* invent structure -- and nodules are
 exactly the small high-frequency features a prior is most likely to invent or
-smooth away. This is the safety experiment, and it is the one a clinician will
-care about most given the 96% false-positive rate that motivates the project.
+smooth away. This is the safety experiment.
 
 Three controlled conditions:
   present   nodule in the ground truth  -> should be detected (sensitivity)
@@ -22,7 +21,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import numpy as np
 import pandas as pd
 import torch
 from tqdm.auto import tqdm

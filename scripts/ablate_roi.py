@@ -7,12 +7,11 @@ Runs the identical two-scale ROI refinement twice -- once with an adaptive
 Gaussian field, once on a plain voxel grid -- at matched iteration count, and
 reports nodule Dice, volume error and wall-clock for each.
 
-This ablation is deliberately falsifiable. The FYDP-1 report justified Gaussian
-splatting on efficiency grounds that its own implementation did not deliver (it
-materialised a dense volume every iteration). The defensible claim is narrower:
-Gaussians are a compact *adaptive* basis. Whether that helps is an empirical
-question, and a negative answer here is a legitimate result to publish -- it
-just means the ROI stage should be plain voxels and 3DGS belongs in the viewer.
+This ablation is deliberately falsifiable. Gaussians cannot be justified on
+efficiency grounds here -- the dense ROI volume is materialised every iteration
+either way. The defensible claim is narrower: they are a compact *adaptive*
+basis. Whether that helps is empirical, and a negative answer is a legitimate
+result: it means the ROI stage should be plain voxels.
 """
 from __future__ import annotations
 
@@ -133,9 +132,8 @@ def main():
               f"({g['rmse_vs_gt']:.5g} vs {v['rmse_vs_gt']:.5g}), at "
               f"{g['seconds']:.1f}s vs {v['seconds']:.1f}s.")
         if not better:
-            print("A negative result here is a legitimate finding: report it, drop the\n"
-                  "Gaussian stage from the reconstruction path, and keep 3DGS (if at\n"
-                  "all) for interactive visualisation only.")
+            print("A negative result is a finding: drop the Gaussian stage from the\n"
+                  "reconstruction path and keep 3DGS, if anywhere, in the viewer.")
     print(f"\nwrote {args.out}")
 
 

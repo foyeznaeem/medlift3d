@@ -4,8 +4,11 @@ solver:
   n_steps: 50                 # DDIM steps, not 1000. 1000 DDPM steps buys nothing
                               # and costs a 20-40x inference slowdown (docs/REVIEW.md C2)
   dc_steps: 2                 # data-consistency steps per diffusion step
-  dc_step: 0.9                # relative to 1/L, L from power iteration on A^T A,
-                              # so this transfers across geometries unchanged
+  dc_step: 0.9                # relative to 1/(c^2 L): L from power iteration on
+                              # A^T A and c = MU_MAX/2 = d(mu)/d(net units), so
+                              # this transfers across geometries unchanged.
+                              # Dropping the c^2 under-relaxes by ~5500x and the
+                              # data term becomes inert without looking it.
   lam_z: 0.03                 # z-direction TV: the inter-slice coupling that lets a
                               # 2-D prior produce a coherent 3-D volume
   guidance: 0.0               # classifier-free guidance strength

@@ -151,9 +151,8 @@ def make_chest_phantom(grid: Grid, seed: int = 0, n_nodules: int = 3,
     # Place only where the sphere fits well inside lung parenchyma.
     dist = ndimage.distance_transform_edt(lung_core, sampling=grid.spacing)
     # `free` shrinks as nodules are placed, so they cannot overlap or merge.
-    # Nodules that touch make per-nodule volumetry ill-posed -- they segment as
-    # one blob -- and that is a modelling artefact, not a real evaluation
-    # difficulty worth reproducing.
+    # Touching nodules segment as one blob, which makes per-nodule volumetry
+    # ill-posed for reasons that have nothing to do with reconstruction.
     free = lung_core.copy()
     mask = np.zeros(grid.shape, dtype=np.uint8)
     nodules = []
@@ -229,19 +228,14 @@ def erase_nodule(grid: Grid, mu: np.ndarray, nodule: dict):
 def lung_mask(mu: np.ndarray, grid: Grid, fill: bool = True) -> np.ndarray:
     """Lung *region* mask, used to restrict PSNR/SSIM and to bound nodule search.
 
-    Holes are filled by default, which matters twice over. A raw
-    air-density threshold excludes nodules and vessels, so (a) `psnr_lung` would
-    be computed everywhere except the structures the project is about, and
-    (b) a nodule would not lie inside its own lung mask, so restricting a
-    segmentation to the mask would delete it. Filling makes this an anatomical
-    region rather than a density band -- which is what standard lung
-    segmentation produces.
-
-    Whole-image PSNR is dominated by air, which every method reconstructs
-    perfectly, so it flatters them all equally and discriminates nothing.
+    Holes are filled by default, which matters twice over. A raw air-density
+    threshold excludes nodules and vessels, so (a) `psnr_lung` would be computed
+    everywhere except the structures the project is about, and (b) a nodule
+    would not lie inside its own lung mask, so restricting a segmentation to the
+    mask would delete it. Filling makes this an anatomical region rather than a
+    density band, which is what standard lung segmentation produces.
     """
-    from .units import hu_to_mu as _h
-    lo, hi = _h(-950.0), _h(-400.0)
+    lo, hi = hu_to_mu(-950.0), hu_to_mu(-400.0)
     m = (mu > lo) & (mu < hi)
     m = ndimage.binary_closing(m, iterations=2)
     lbl, n = ndimage.label(m)

@@ -30,6 +30,7 @@ GATES = [
     ("--  diffusion train/sample config", "tests/test_diffusion_config.py"),
     ("--  ROI decomposition exactness", "tests/test_roi_exact.py"),
     ("--  Gaussian field", "tests/test_gaussians.py"),
+    ("--  solver data consistency", "tests/test_solver.py"),
 ]
 
 

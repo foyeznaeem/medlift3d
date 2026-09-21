@@ -10,12 +10,11 @@ download (~124 GB) is not feasible there:
     # B) a directory of volumes already on disk (Kaggle-hosted LUNA/LIDC subsets)
     python scripts/prepare_lidc.py --source dir --in /kaggle/input/luna16 --out data/lidc
 
-LIDC-IDRI is the right dataset for this project because it is the only public
-source with **voxel-level nodule contours** -- four independent readers per
-nodule. Challenge sets in the LUNA family ship centroids and malignancy labels,
-which cannot produce a segmentation ground truth, so Dice and volume error are
-not computable from them. Route B therefore imports volumes without masks: they
-are usable for training the prior, not for the clinical metrics.
+LIDC-IDRI is the only public source with **voxel-level nodule contours** (four
+independent readers per nodule). Challenge sets in the LUNA family ship
+centroids and malignancy labels, from which no segmentation ground truth can be
+built, so Dice and volume error are not computable. Route B therefore imports
+volumes without masks: usable for training the prior, not for clinical metrics.
 
 Ground-truth masks use >= 50% reader consensus.
 """
@@ -51,17 +50,33 @@ def resample_to_canonical(hu: np.ndarray, src: Grid, dst: Grid) -> np.ndarray:
 
 
 def grid_from_sitk(image) -> tuple[Grid, np.ndarray]:
-    """SimpleITK image -> (Grid, HU array in (z, y, x)).
+    """SimpleITK image -> (Grid, HU array in (z, y, x)), converted LPS -> RAS.
 
-    SimpleITK is LPS, NIfTI/this project is RAS, so x and y flip. Spacing comes
-    from the direction-scaled columns, never from `np.diag`.
+    Going from LPS to RAS negates the x and y world axes. Negating the origin
+    alone is not the conversion: with spacing kept positive the array itself has
+    to be reversed along those two axes, and the origin becomes the *far* corner
+    negated. Doing only half of it leaves a volume that is mirrored left-right
+    and anterior-posterior with respect to the frame it claims, which is
+    self-consistent inside this pipeline and wrong the moment laterality
+    matters -- an exported NIfTI, or a nodule reported in the wrong lung.
     """
     import SimpleITK as sitk
-    arr = sitk.GetArrayFromImage(image).astype(np.float32)      # (z, y, x)
+    arr = sitk.GetArrayFromImage(image).astype(np.float32)      # (z, y, x) LPS
     sp = image.GetSpacing()                                     # (x, y, z)
     org = image.GetOrigin()                                     # (x, y, z) LPS
-    grid = Grid(arr.shape, (float(sp[2]), float(sp[1]), float(sp[0])),
-                (float(org[2]), -float(org[1]), -float(org[0])))
+    direction = np.asarray(image.GetDirection(), dtype=np.float64).reshape(3, 3)
+    if not np.allclose(np.abs(direction), np.eye(3), atol=1e-3):
+        raise ValueError(
+            f"oblique acquisition (direction={direction.tolist()}); this "
+            f"importer assumes axis-aligned volumes")
+
+    nz, ny, nx = arr.shape
+    arr = np.ascontiguousarray(arr[:, ::-1, ::-1])              # -> RAS
+    origin = (float(org[2]),
+              -(float(org[1]) + (ny - 1) * float(sp[1])),
+              -(float(org[0]) + (nx - 1) * float(sp[0])))
+    grid = Grid((nz, ny, nx),
+                (float(sp[2]), float(sp[1]), float(sp[0])), origin)
     return grid, arr
 
 

@@ -6,16 +6,18 @@ and it removes a 3-D autoencoder from the critical path entirely. 3-D coherence
 comes from the physics -- rays cross slices, so the projector couples them --
 plus an explicit z-direction TV term in the solver.
 
-Conditioning is by **channel concatenation of a spatially aligned volume** (a
-CGLS or FBP initialisation), not by cross-attention to a pooled descriptor. A
-globally average-pooled projection encoding cannot localise a nodule: it says
-roughly "a chest with about this much total attenuation" and nothing about
-where anything is. An aligned conditioning channel says exactly where.
+The prior is **unconditional by default**, which is the DiffusionMBIR design:
+anatomy comes from the prior and patient specificity comes from the measurement
+operator in `solver.py`. Conditioning is optional and, when used, must be by
+channel concatenation of a spatially aligned volume that also exists at
+inference -- a CGLS or FBP initialisation. Conditioning on the clean target
+teaches the network to copy its conditioning channel, which looks like a
+perfect training loss and reproduces the initialisation at inference.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn as nn
@@ -25,7 +27,7 @@ import torch.nn.functional as F
 @dataclass
 class UNetConfig:
     in_ch: int = 1                # noisy slice
-    cond_ch: int = 1              # aligned conditioning slice(s); 0 disables
+    cond_ch: int = 0              # aligned conditioning slice(s); 0 = unconditional
     out_ch: int = 1
     base_dim: int = 64
     dim_mults: tuple[int, ...] = (1, 2, 4, 8)

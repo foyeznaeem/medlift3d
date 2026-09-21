@@ -1,9 +1,7 @@
 """Data layer: cases on disk, patient-level splits, and simulation.
 
 Every case is one `.npz` carrying its own physical frame. A loader that returns
-a bare array has already lost the information needed to evaluate it, which is
-how the FYDP-1 pipeline ended up comparing a 324x65x94 reconstruction against a
-512x512x184 ground truth.
+a bare array has already lost the information needed to evaluate it.
 
 Splits are **patient-level and committed to disk**. If the prior has seen a test
 patient then hallucination is indistinguishable from reconstruction and the
@@ -11,6 +9,7 @@ entire safety argument collapses, so `verify_split` is a hard check, not advice.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,7 +20,7 @@ from torch.utils.data import Dataset
 
 from .geometry import Grid
 from .projector import DTSGeometry, ParallelGeometry, Projector
-from .units import apply_poisson
+from .units import apply_poisson, mu_to_net
 
 REQUIRED_KEYS = ("mu", "shape", "spacing", "origin")
 
@@ -49,8 +48,14 @@ def default_dirs() -> dict:
 # ----------------------------------------------------------------------------
 
 def save_case(path, mu: np.ndarray, grid: Grid, nodule_mask: np.ndarray | None = None,
-              projections: dict | None = None, meta: dict | None = None) -> Path:
-    """Write one case. `projections` maps a track name to its array + geometry."""
+              projections: dict | None = None, meta: dict | None = None,
+              conditioning: dict | None = None) -> Path:
+    """Write one case.
+
+    `projections` maps a track name to its array + geometry. `conditioning` maps
+    a name to a volume on the same grid -- a classical reconstruction, for
+    training a conditional prior on something that also exists at inference.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -65,6 +70,8 @@ def save_case(path, mu: np.ndarray, grid: Grid, nodule_mask: np.ndarray | None =
     for name, rec in (projections or {}).items():
         payload[f"proj_{name}"] = np.asarray(rec["projections"], dtype=np.float32)
         payload[f"geom_{name}"] = np.array(json.dumps(rec["geometry"]))
+    for name, vol in (conditioning or {}).items():
+        payload[f"cond_{name}"] = np.asarray(vol, dtype=np.float32)
     np.savez_compressed(path, **payload)
     return path
 
@@ -130,12 +137,10 @@ def simulate(mu: np.ndarray, grid: Grid, geom, i0: float | None = 1e5,
              seed: int = 0, device="cpu", chunk_rays: int = 8192) -> np.ndarray:
     """Forward project with the SAME operator the solver optimises through.
 
-    This is the invariant the FYDP-1 pipeline broke: it simulated polychromatic,
-    flood-corrected, log-transformed projections of a density field and then
-    compared them against monochromatic line integrals of a [0,1] field. Two
-    incompatible physics models either side of one MSE. Simulate with the
-    operator you optimise through, or accept a domain gap and measure it
-    deliberately (see `scripts/simulate.py --polychromatic`).
+    Simulating with different physics from the one being optimised (polychromatic
+    and flood-corrected on one side, monochromatic line integrals on the other)
+    puts two incompatible models either side of one MSE. Either match them, or
+    accept the domain gap deliberately and measure it.
     """
     proj = Projector(grid, geom, device=device, chunk_rays=chunk_rays)
     with torch.no_grad():
@@ -204,16 +209,15 @@ def verify_split(split: dict) -> None:
 class CaseDataset(Dataset):
     """Whole cases, for reconstruction and evaluation."""
 
-    def __init__(self, data_dir, case_ids=None, track: str | None = None):
+    def __init__(self, data_dir, case_ids=None):
         self.dir = Path(data_dir)
         files = sorted(self.dir.glob("*.npz"))
         if case_ids is not None:
             keep = set(str(c) for c in case_ids)
             files = [f for f in files if f.stem in keep]
-        self.files = files
-        self.track = track
         if not files:
             raise FileNotFoundError(f"no .npz cases in {self.dir}")
+        self.files = files
 
     def __len__(self):
         return len(self.files)
@@ -225,16 +229,26 @@ class CaseDataset(Dataset):
 class SliceDataset(Dataset):
     """Axial slices of `mu`, for training the 2-D prior.
 
-    Slices are indexed lazily through an (case, z) table so memory stays flat
-    regardless of dataset size, and `mmap` keeps startup fast.
+    Backed by a memory-mapped slice cache, built once on construction. The
+    obvious implementation -- open the case `.npz` and index one slice -- costs a
+    full decompression of the volume *per slice*: measured at 357 ms for a
+    256^3 case, which is ~1.2 h of pure I/O per epoch and swamps the training
+    budget several times over. The cache is one contiguous `.npy` of the kept
+    slices, so random access is a page fault instead.
+
+    `cond_key` names a conditioning volume stored in the case (see `save_case`)
+    and returns the matching slice under `"cond"`. It must be something that
+    also exists at inference, such as a CGLS initialisation. Never condition on
+    `mu` itself: the network then learns to copy its conditioning channel, and
+    at inference it will faithfully copy the blurry initialisation instead.
     """
 
     def __init__(self, data_dir, case_ids=None, min_content: float = 1e-3,
-                 normalise=True, cond_key: str | None = None):
-        from .units import mu_to_net
+                 normalise=True, cond_key: str | None = None,
+                 cache_dir=None, cache: bool = True):
         self.dir = Path(data_dir)
         self.normalise = normalise
-        self._to_net = mu_to_net
+        self.cond_key = cond_key
         files = sorted(self.dir.glob("*.npz"))
         if case_ids is not None:
             keep = set(str(c) for c in case_ids)
@@ -242,21 +256,104 @@ class SliceDataset(Dataset):
         if not files:
             raise FileNotFoundError(f"no .npz cases in {self.dir}")
         self.files = files
+        self.fields = ["mu"] + ([f"cond_{cond_key}"] if cond_key else [])
+
         self.index: list[tuple[int, int]] = []
+        slice_shape = None
         for fi, f in enumerate(files):
             with np.load(f, allow_pickle=False) as z:
+                for field in self.fields[1:]:
+                    if field not in z:
+                        raise KeyError(
+                            f"{f.name} has no {field!r}; regenerate the dataset "
+                            f"with that conditioning volume, or train the prior "
+                            f"unconditionally")
                 mu = z["mu"]
+                if slice_shape is None:
+                    slice_shape = mu.shape[1:]
+                elif mu.shape[1:] != slice_shape:
+                    raise ValueError(
+                        f"{f.name} has slices of {mu.shape[1:]}, expected "
+                        f"{slice_shape}; resample every case onto one grid")
                 # Skip near-empty slices: they teach the prior nothing and
                 # inflate the epoch.
                 keep_z = np.where(mu.reshape(mu.shape[0], -1).mean(1) > min_content)[0]
             self.index.extend((fi, int(zi)) for zi in keep_z)
 
+        self.slice_shape = slice_shape
+        self._cache_path = self._build_cache(cache_dir) if cache else None
+        self._cache = None      # opened lazily, so DataLoader workers each mmap
+
+    # -- slice cache -----------------------------------------------------------
+
+    def _cache_key(self) -> str:
+        sig = "|".join([*(f.stem for f in self.files), *self.fields,
+                        str(self.slice_shape), str(len(self.index))])
+        return hashlib.sha1(sig.encode()).hexdigest()[:16]
+
+    def _build_cache(self, cache_dir):
+        """Write (or reuse) the flat slice cache. Returns its path, or None."""
+        for base in (cache_dir, self.dir, default_dirs()["out"] / "slice_cache"):
+            if base is None:
+                continue
+            base = Path(base)
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+                path = base / f"slices_{self._cache_key()}.npy"
+                break
+            except OSError:
+                continue            # read-only, e.g. /kaggle/input
+        else:
+            return None
+
+        shape = (len(self.index), len(self.fields), *self.slice_shape)
+        if path.exists() and path.stat().st_size >= int(np.prod(shape)) * 4:
+            return path
+
+        out = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32,
+                                        shape=shape)
+        rows = 0
+        for fi, f in enumerate(self.files):
+            zs = [i for i, (cf, _) in enumerate(self.index) if cf == fi]
+            if not zs:
+                continue
+            with np.load(f, allow_pickle=False) as z:
+                for ci, field in enumerate(self.fields):
+                    vol = z[field]      # one decompression per (case, field)
+                    for row in zs:
+                        out[row, ci] = vol[self.index[row][1]]
+            rows += len(zs)
+        out.flush()
+        del out
+        return path
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_path.stat().st_size if self._cache_path else 0
+
+    def _mmap(self):
+        if self._cache is None and self._cache_path is not None:
+            self._cache = np.load(self._cache_path, mmap_mode="r")
+        return self._cache
+
     def __len__(self):
         return len(self.index)
 
+    def _to_tensor(self, arr):
+        arr = np.asarray(arr, dtype=np.float32)
+        if self.normalise:
+            arr = mu_to_net(arr)
+        return torch.from_numpy(np.ascontiguousarray(arr))
+
     def __getitem__(self, i):
-        fi, zi = self.index[i]
-        with np.load(self.files[fi], allow_pickle=False, mmap_mode="r") as z:
-            sl = np.asarray(z["mu"][zi], dtype=np.float32)
-        x = self._to_net(sl) if self.normalise else sl
-        return {"x": torch.from_numpy(np.ascontiguousarray(x))[None]}
+        cache = self._mmap()
+        if cache is not None:
+            row = cache[i]
+        else:
+            fi, zi = self.index[i]
+            with np.load(self.files[fi], allow_pickle=False) as z:
+                row = np.stack([z[f][zi] for f in self.fields])
+        out = {"x": self._to_tensor(row[0])[None]}
+        if len(self.fields) > 1:
+            out["cond"] = self._to_tensor(row[1])[None]
+        return out

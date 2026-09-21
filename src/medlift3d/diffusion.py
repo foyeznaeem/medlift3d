@@ -1,14 +1,13 @@
 """DDPM training and DDIM sampling.
 
-The single most damaging bug in the FYDP-1 code was a train/sample mismatch: the
-network was trained to predict noise and the sampler interpreted its output as
-the clean signal, silently, for 1000 steps. Nothing crashed; the reconstruction
-was simply garbage.
+A train/sample mismatch here is silent and total: train the network to predict
+noise, interpret its output as the clean signal at sampling time, and nothing
+crashes -- the reconstruction is simply garbage.
 
-That is made structurally impossible here. `DiffusionConfig` is frozen, it is
-written into every checkpoint, and `GaussianDiffusion.load` refuses a checkpoint
-whose config differs from the one being constructed. There is no code path that
-lets training and sampling disagree.
+That is made structurally impossible. `DiffusionConfig` is frozen, it is written
+into every checkpoint, and `load_state` refuses a checkpoint whose config
+differs from the one being constructed, so no code path lets training and
+sampling disagree.
 """
 from __future__ import annotations
 
@@ -183,18 +182,17 @@ class GaussianDiffusion(torch.nn.Module):
     # -- checkpoints -----------------------------------------------------------
 
     def state(self, **extra) -> dict:
+        mcfg = getattr(self.model, "cfg", None)
         return {"model": self.model.state_dict(),
                 "diffusion_cfg": self.cfg.to_dict(),
-                "unet_cfg": getattr(self.model, "cfg", None).to_dict()
-                if hasattr(getattr(self.model, "cfg", None), "to_dict") else None,
+                "unet_cfg": mcfg.to_dict() if hasattr(mcfg, "to_dict") else None,
                 **extra}
 
     def load_state(self, ckpt: dict, strict: bool = True) -> None:
         """Load weights, refusing any checkpoint whose diffusion config differs.
 
-        This is the guard that makes the FYDP-1 train/sample mismatch
-        unreachable: a checkpoint trained with `objective='eps'` cannot be loaded
-        into a sampler built with `objective='x0'`.
+        A checkpoint trained with `objective='eps'` cannot be loaded into a
+        sampler built with `objective='x0'`.
         """
         saved = ckpt.get("diffusion_cfg")
         if saved is not None:
@@ -202,13 +200,13 @@ class GaussianDiffusion(torch.nn.Module):
             diff = {k: (saved.get(k), mine.get(k)) for k in mine
                     if saved.get(k) != mine.get(k)}
             # Sampling-time knobs may legitimately differ from training.
-            diff.pop("cfg_drop_prob", None)
+            diff.pop("cfg_drop_prob", None)   # a sampling-time knob
             if diff and strict:
                 raise ValueError(
                     "diffusion config mismatch between checkpoint and sampler "
-                    f"(checkpoint, current): {diff}. Refusing to load -- this is "
-                    "exactly the silent train/sample mismatch that produces "
-                    "garbage reconstructions."
+                    f"(checkpoint, current): {diff}. Refusing to load: this is "
+                    "the silent train/sample mismatch that produces garbage "
+                    "reconstructions."
                 )
         self.model.load_state_dict(ckpt["model"])
 

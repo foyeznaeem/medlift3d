@@ -5,7 +5,6 @@ residual `p - A(mu_bg)` is precisely what the ROI has to explain. The same-grid
 case is exact and is asserted; the fine-grid case additionally incurs resampling
 error, which is *measured* here rather than assumed away.
 """
-import numpy as np
 import pytest
 import torch
 

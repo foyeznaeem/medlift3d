@@ -3,12 +3,10 @@
 
     python scripts/mdvc.py --tracks A32 A16 B15 --gains 0.05 0.1 0.25 0.5
 
-This is the experiment that answers the project's clinical objective directly.
-Volume Doubling Time needs a *change* in volume to be measurable, and LIDC has
-no follow-up scans -- so growth is synthesised on the ground truth, the
-projections are re-simulated, and the same measurement is applied to both
-reconstructions. The output curve says where absolute volumetry stops being
-trustworthy, which is a real finding rather than an overclaim.
+Volume Doubling Time needs a *change* in volume to be measurable and LIDC has no
+follow-up scans, so growth is synthesised on the ground truth, the projections
+are re-simulated, and the same measurement is applied to both reconstructions.
+The output curve says where absolute volumetry stops being trustworthy.
 """
 from __future__ import annotations
 

@@ -10,14 +10,15 @@ to sever it.
 therefore computes `A^T` by a VJP rather than by a second hand-written kernel,
 which makes an fp/bp inconsistency structurally impossible.
 
-Note that `bp` is the plain adjoint back-projection, NOT filtered back-projection.
-FBP applies a ramp filter and is a *reconstruction* operator; using it as a
-gradient gives wrong updates that still look like they are converging. Filtered
+`bp` is the plain adjoint back-projection, NOT filtered back-projection. FBP
+applies a ramp filter and is a *reconstruction* operator; using it as a gradient
+gives wrong updates that still look like they are converging. Filtered
 back-projection lives in `medlift3d.baselines.fbp`.
 """
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -195,7 +196,11 @@ Geometry = ParallelGeometry | DTSGeometry
 # ----------------------------------------------------------------------------
 
 def _ray_box_t(origins, dirs, lo, hi):
-    """Slab-method ray/AABB intersection. Returns (t_near, t_far, valid)."""
+    """Slab-method ray/AABB intersection.
+
+    Returns (t_near, t_far), both zero for rays that miss the box -- so their
+    step length `dt` is zero and they contribute nothing.
+    """
     inv = 1.0 / torch.where(dirs.abs() < _EPS, torch.full_like(dirs, _EPS), dirs)
     t1 = (lo - origins) * inv
     t2 = (hi - origins) * inv
@@ -244,8 +249,8 @@ class Projector:
         self.t_near, self.t_far = t_near, t_far
         self.dt = (t_far - t_near) / self.n_samples          # 0 for rays that miss
 
-        frac = (torch.arange(self.n_samples, device=self.device, dtype=dtype) + 0.5) / self.n_samples
-        self._frac = frac
+        self._frac = ((torch.arange(self.n_samples, device=self.device, dtype=dtype)
+                       + 0.5) / self.n_samples)
 
     # -- helpers ---------------------------------------------------------------
 
@@ -254,15 +259,19 @@ class Projector:
         detector is over-sized; very low means it is mis-aimed."""
         return float((self.dt > 0).float().mean())
 
-    def _sample_chunk(self, vol5: torch.Tensor, sl: slice) -> torch.Tensor:
-        """Line integral for a slice of rays. `vol5` is [1, 1, nz, ny, nx]."""
-        o = self.origins[sl]                                   # [R,3]
+    def _ray_points(self, sl: slice):
+        """World-space sample points [R, S, 3] and per-ray step for a ray slice."""
+        o = self.origins[sl]
         d = self.dirs[sl]
         tn = self.t_near[sl]
-        dt = self.dt[sl]
-        span = (self.t_far[sl] - tn)
+        span = self.t_far[sl] - tn
         t = tn[:, None] + self._frac[None, :] * span[:, None]   # [R,S]
         pts = o[:, None, :] + d[:, None, :] * t[..., None]      # [R,S,3] world xyz
+        return pts, self.dt[sl]
+
+    def _sample_chunk(self, vol5: torch.Tensor, sl: slice) -> torch.Tensor:
+        """Line integral for a slice of rays. `vol5` is [1, 1, nz, ny, nx]."""
+        pts, dt = self._ray_points(sl)
         g = self.grid.world_to_norm(pts).view(1, pts.shape[0], self.n_samples, 1, 3)
         vals = F.grid_sample(vol5, g, mode="bilinear",
                              padding_mode="zeros", align_corners=True)
@@ -282,16 +291,6 @@ class Projector:
                for i in range(0, self.n_rays, self.chunk_rays)]
         return torch.cat(out, 0).view(self.proj_shape)
 
-    def _ray_points(self, sl: slice):
-        """World-space sample points and per-ray step for a slice of rays."""
-        o = self.origins[sl]
-        d = self.dirs[sl]
-        tn = self.t_near[sl]
-        span = self.t_far[sl] - tn
-        t = tn[:, None] + self._frac[None, :] * span[:, None]      # [R,S]
-        pts = o[:, None, :] + d[:, None, :] * t[..., None]          # [R,S,3]
-        return pts, self.dt[sl]
-
     def bp_scatter(self, projs: torch.Tensor) -> torch.Tensor:
         """Adjoint by explicit trilinear scatter.
 
@@ -303,7 +302,7 @@ class Projector:
         Kept as an alternative rather than the default: measured on CPU it is
         several times slower than routing through `grid_sample`'s fused backward
         kernel. Benchmark both on your hardware via `Projector.benchmark_bp`
-        before choosing; set `bp_impl="scatter"` to select it.
+        before choosing, then pass `bp_impl="scatter"` to select it.
         """
         if tuple(projs.shape) != tuple(self.proj_shape):
             raise ValueError(f"projs shape {tuple(projs.shape)} != {self.proj_shape}")
@@ -341,10 +340,10 @@ class Projector:
     def bp_vjp(self, projs: torch.Tensor) -> torch.Tensor:
         """Adjoint as the vector-Jacobian product of `fp`.
 
-        `A` is linear, so its VJP *is* `A^T` -- an fp/bp inconsistency is
-        structurally impossible here, which is why this is the default.
-        Gradients accumulate into a single `probe.grad` buffer across chunks, so
-        peak memory is one volume regardless of ray count.
+        `A` is linear, so its VJP *is* `A^T`: an fp/bp inconsistency is
+        structurally impossible, which is why this is the default. Gradients
+        accumulate into one `probe.grad` buffer across chunks, so peak memory is
+        a single volume regardless of ray count.
         """
         if tuple(projs.shape) != tuple(self.proj_shape):
             raise ValueError(f"projs shape {tuple(projs.shape)} != {self.proj_shape}")
@@ -360,9 +359,8 @@ class Projector:
     def bp(self, projs: torch.Tensor) -> torch.Tensor:
         """Adjoint back-projection `A^T p`. Returns [nz, ny, nx].
 
-        NOT filtered back-projection: there is no ramp filter here. Using FBP as
-        a gradient gives wrong updates that still look like they converge.
-        Filtered back-projection lives in `medlift3d.baselines.fbp`.
+        NOT filtered back-projection: there is no ramp filter here. See
+        `medlift3d.baselines.fbp` for that.
         """
         if self.bp_impl == "scatter":
             return self.bp_scatter(projs)
@@ -374,7 +372,6 @@ class Projector:
         Which one wins depends on grid size, ray count and device, so measure
         rather than assume.
         """
-        import time
         y = torch.rand(self.proj_shape, device=self.device, dtype=self.dtype)
         out = {}
         for name, fn in (("vjp", self.bp_vjp), ("scatter", self.bp_scatter)):
@@ -386,7 +383,6 @@ class Projector:
         out["faster"] = min(out, key=out.get)
         return out
 
-    # `A x - p` and its gradient show up in every solver, so give them a home.
     def residual(self, mu: torch.Tensor, projs: torch.Tensor) -> torch.Tensor:
         return self.fp(mu) - projs
 

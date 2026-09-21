@@ -1,9 +1,9 @@
 """Voxel grids that know where they are in space.
 
-The deepest failure mode in volumetric reconstruction is an array that has lost
-its physical frame: a reconstruction and its ground truth end up on different
-grids and every metric computed between them is meaningless. `Grid` makes the
-frame part of the type, and `assert_matches` makes a mismatch a loud error.
+An array that has lost its physical frame is the deepest failure mode in
+volumetric reconstruction: a reconstruction and its ground truth end up on
+different grids and every metric between them is meaningless. `Grid` makes the
+frame part of the type and `assert_matches` makes a mismatch a loud error.
 
 Conventions, without exception:
   * index order is (z, y, x) -- z is cranio-caudal, y anterior-posterior, x left-right
