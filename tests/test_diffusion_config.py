@@ -120,3 +120,35 @@ def test_slice_dataset_serves_a_stored_conditioning_volume(tmp_path):
     item = SliceDataset(tmp_path, cond_key="cgls")[0]
     assert item["cond"].shape == item["x"].shape
     assert not torch.equal(item["cond"], item["x"]), "conditioning must not be the target"
+
+
+def test_multi_gpu_wrapper_keeps_checkpoints_single_gpu():
+    """A checkpoint written on two GPUs must load on one, and vice versa.
+
+    Wrapping the net in DataParallel normally prefixes every state_dict key
+    with "module." and hides `model.cfg`, which would make checkpoints from a
+    multi-GPU run unloadable anywhere else -- discovered only when you try to
+    resume. `parallelize()` keeps the wrapper out of the module registry so
+    `state()` is byte-identical either way.
+    """
+    import torch.nn as nn
+
+    d = _make("eps")
+    clean = list(d.state()["model"])
+
+    # what parallelize() does when two GPUs are visible
+    object.__setattr__(d, "_net", nn.DataParallel(d.model))
+
+    assert "_net" not in d._modules, "wrapper must not register as a submodule"
+    assert d.net is not d.model, "forward calls should go through the wrapper"
+    state = d.state()
+    assert list(state["model"]) == clean, "state_dict keys changed"
+    assert not any(k.startswith("module.") for k in state["model"])
+    assert state["unet_cfg"] is not None, "model.cfg must still resolve"
+    GaussianDiffusion.from_checkpoint(state)      # must rebuild without a GPU
+
+
+def test_parallelize_is_a_noop_without_multiple_gpus():
+    d = _make("eps").parallelize()
+    assert d.net is d.model
+    assert d.n_devices == 1

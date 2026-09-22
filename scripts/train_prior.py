@@ -49,7 +49,7 @@ def validate(diff, loader, device, n_batches=None, seed=1234):
         t = torch.randint(0, diff.cfg.timesteps, (x.shape[0],), generator=g).to(device)
         noise = torch.randn(x.shape, generator=g).to(device)
         x_t = diff.q_sample(x, t, noise)
-        pred = diff.model(x_t, t, cond)
+        pred = diff.net(x_t, t, cond)
         target = noise if diff.cfg.objective == "eps" else x
         tot += float(torch.nn.functional.mse_loss(pred, target).detach()) * x.shape[0]
         n += x.shape[0]
@@ -83,6 +83,11 @@ def main():
                          "unconditional prior, which is the default: data "
                          "consistency then supplies all patient specificity.")
     ap.add_argument("--amp", action="store_true", default=None)
+    ap.add_argument("--multi-gpu", action="store_true",
+                    help="split each batch across every visible GPU. Kaggle "
+                         "gives two T4s and only one is used otherwise. Raise "
+                         "--batch-size alongside it: the batch is divided, so "
+                         "8 across two cards costs what 4 did on one")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--max-hours", type=float, default=None,
                     help="stop cleanly after this long (Kaggle sessions die at 12h)")
@@ -120,6 +125,14 @@ def main():
     dcfg = DiffusionConfig(timesteps=args.timesteps, objective=args.objective,
                            cfg_drop_prob=args.cfg_drop)
     diff = GaussianDiffusion(UNet2D(ucfg), dcfg).to(device)
+    if args.multi_gpu:
+        diff.parallelize()
+        if diff.n_devices > 1:
+            names = [torch.cuda.get_device_name(i) for i in range(diff.n_devices)]
+            print(f"multi-GPU: batch split across {diff.n_devices} x {names[0]}")
+        else:
+            print("--multi-gpu asked for, but only one GPU is visible; "
+                  "running on it alone")
     print(f"UNet {diff.model.n_params/1e6:.1f}M params  cond_ch={ucfg.cond_ch}  "
           f"objective={dcfg.objective}")
 

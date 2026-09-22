@@ -81,6 +81,36 @@ class GaussianDiffusion(torch.nn.Module):
         self.register_buffer("sqrt_ac", alphas_cumprod.sqrt().float())
         self.register_buffer("sqrt_1mac", (1.0 - alphas_cumprod).sqrt().float())
 
+    # -- multi-GPU -------------------------------------------------------------
+
+    def parallelize(self, device_ids=None) -> "GaussianDiffusion":
+        """Split each batch across several GPUs for the network's forward pass.
+
+        `self.model` deliberately stays the bare UNet. The wrapper is kept out
+        of the module registry (`object.__setattr__`) so it is never registered
+        as a submodule, which means `state()` keeps writing single-GPU
+        checkpoints: no `module.` key prefix, and `self.model.cfg` still
+        resolves, so `from_checkpoint` can rebuild the net either way. A
+        checkpoint written on two GPUs loads on one, and the reverse.
+
+        A no-op with fewer than two visible GPUs, so calling it is always safe.
+        """
+        n = torch.cuda.device_count()
+        if n > 1:
+            object.__setattr__(
+                self, "_net", torch.nn.DataParallel(self.model, device_ids=device_ids))
+        return self
+
+    @property
+    def net(self):
+        """The network to call. The DataParallel wrapper if one was made."""
+        return getattr(self, "_net", None) or self.model
+
+    @property
+    def n_devices(self) -> int:
+        net = getattr(self, "_net", None)
+        return len(net.device_ids) if net is not None else 1
+
     # -- forward process -------------------------------------------------------
 
     def q_sample(self, x0, t, noise=None):
@@ -118,7 +148,7 @@ class GaussianDiffusion(torch.nn.Module):
             keep = (torch.rand(b, device=x0.device) >= self.cfg.cfg_drop_prob)
             cond = cond * keep.view(-1, *((1,) * (cond.ndim - 1))).to(cond.dtype)
 
-        pred = self.model(x_t, t, cond)
+        pred = self.net(x_t, t, cond)
         target = noise if self.cfg.objective == "eps" else x0
         if self.cfg.loss_type == "l2":
             return F.mse_loss(pred, target)
@@ -131,10 +161,10 @@ class GaussianDiffusion(torch.nn.Module):
     @torch.no_grad()
     def predict_eps(self, x_t, t, cond=None, guidance: float = 0.0):
         """Model output converted to eps, with optional classifier-free guidance."""
-        out = self.model(x_t, t, cond)
+        out = self.net(x_t, t, cond)
         eps = out if self.cfg.objective == "eps" else self.x0_to_eps(x_t, t, out)
         if guidance > 0 and cond is not None:
-            out_u = self.model(x_t, t, None)
+            out_u = self.net(x_t, t, None)
             eps_u = out_u if self.cfg.objective == "eps" else self.x0_to_eps(x_t, t, out_u)
             eps = eps_u + (1.0 + guidance) * (eps - eps_u)
         return eps
