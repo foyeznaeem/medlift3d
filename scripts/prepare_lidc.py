@@ -81,6 +81,14 @@ def grid_from_sitk(image) -> tuple[Grid, np.ndarray]:
 
 
 def iter_pylidc(limit, max_slice_thickness):
+    # pylidc calls configparser.SafeConfigParser, which Python 3.12 removed
+    # (it has been a deprecated alias of ConfigParser since 3.2). Kaggle runs
+    # 3.12, so without this every scan fails inside to_volume() with
+    # "module 'configparser' has no attribute 'SafeConfigParser'".
+    import configparser
+    if not hasattr(configparser, "SafeConfigParser"):
+        configparser.SafeConfigParser = configparser.ConfigParser
+
     import pylidc as pl
     scans = pl.query(pl.Scan).filter(pl.Scan.slice_thickness <= max_slice_thickness)
     for scan in scans.limit(limit) if limit else scans:
