@@ -122,9 +122,16 @@ def iter_pylidc(limit, max_slice_thickness, skip=0):
             print(f"  skip {scan.patient_id}: {e}")
             continue
         hu = np.transpose(vol, (2, 0, 1))                       # -> (z, y, x)
-        grid = Grid(hu.shape,
-                    (float(scan.slice_thickness), float(scan.pixel_spacing),
-                     float(scan.pixel_spacing)))
+        # CENTRED, not Grid(...). pylidc gives no patient position, so a bare
+        # Grid defaults to origin (0,0,0) and the volume occupies the positive
+        # octant 0..358mm, while the canonical grid spans -191..191mm. Only the
+        # overlapping corner would survive the resample, leaving a
+        # three-quarters-empty volume with a sliver of patient in one corner.
+        # Nodule coordinates below are derived from this grid, so centring here
+        # keeps them consistent automatically.
+        grid = Grid.centred(hu.shape,
+                            (float(scan.slice_thickness), float(scan.pixel_spacing),
+                             float(scan.pixel_spacing)))
         # >= 50% reader consensus over clustered annotations.
         mask = np.zeros(hu.shape, dtype=np.uint8)
         nodules = []
@@ -169,6 +176,10 @@ def iter_dir(in_dir, limit, max_slice_thickness):
             continue
         if grid.spacing[0] > max_slice_thickness:
             continue
+        # Re-centre for the same reason as the pylidc route: the scanner's
+        # absolute coordinates are wherever they happen to be, and only the
+        # patient's position within the canonical volume matters here.
+        grid = Grid.centred(grid.shape, grid.spacing)
         # No contours available on this route -> no nodule mask.
         yield f.name.split(".")[0], hu, grid, None, {"source": str(f.parent)}
 
@@ -227,6 +238,16 @@ def main():
         hu_r = resample_to_canonical(hu, src_grid, dst)
         mu = hu_to_mu(hu_r).astype(np.float32)
 
+        # A correctly placed chest fills a good part of the volume. Far less
+        # than that means the source and canonical grids are misaligned and the
+        # patient is falling off the edge -- which reconstructs perfectly well
+        # and is perfectly useless.
+        filled = float((mu > hu_to_mu(-900.0)).mean())
+        if filled < 0.05:
+            print(f"  skip {cid}: only {filled:.1%} of the volume is above air; "
+                  f"source and canonical grids look misaligned")
+            continue
+
         mask_r = None
         if mask is not None:
             # Nearest-neighbour equivalent: resample each label and threshold,
@@ -238,6 +259,10 @@ def main():
                 m = resample_to_canonical((mask == lab).astype(np.float32),
                                           src_grid, dst)
                 mask_r[m >= 0.5] = lab
+        # Count masks that SURVIVED the resample. Counting the ones the source
+        # had instead reported "40 with nodule masks" while the resample was
+        # silently dropping them off the edge of the grid.
+        if mask_r.any():
             n_with_masks += 1
 
         projections = {}
