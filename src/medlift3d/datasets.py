@@ -162,6 +162,12 @@ def make_split(case_ids, fractions=(0.75, 0.125, 0.125), seed: int = 42) -> dict
     n = len(ids)
     n_tr = int(round(fractions[0] * n))
     n_va = int(round(fractions[1] * n))
+    # With few cases the rounding empties val or test, and an empty test set
+    # makes the dataset useless for the thing it exists for. Give each split
+    # one case whenever there are enough to go round.
+    if n >= 3:
+        n_tr = min(n_tr, n - 2)
+        n_va = min(max(n_va, 1), n - n_tr - 1)
     return {"train": sorted(ids[:n_tr]),
             "val": sorted(ids[n_tr:n_tr + n_va]),
             "test": sorted(ids[n_tr + n_va:]),

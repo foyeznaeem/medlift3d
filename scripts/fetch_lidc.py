@@ -1,22 +1,20 @@
 #!/usr/bin/env python
 """Download LIDC-IDRI CT series from TCIA, in the layout pylidc expects.
 
-TCIA's public NBIA API needs no key for LIDC-IDRI. `getSeries` lists the
-collection (so no `.tcia` manifest is needed) and `getImage` returns a zip of
-one series.
+The series list comes from **pylidc's own database**, not from TCIA's
+`getSeries`, and with the same `slice_thickness` filter `prepare_lidc.py`
+applies. That coordination is the point: driving the two scripts from
+different lists means downloading one patient and then asking pylidc to ingest
+a different one, which fails with "Couldn't find DICOM files" for a scan that
+was never requested.
 
-The layout matters and is not negotiable. `pylidc.Scan.get_path_to_dicom_files`
-does:
+Only pixel data is fetched. pylidc ships the annotations itself (1,018 scans,
+6,859 readings, 41,406 contours in a 25 MB SQLite file), so there is nothing
+else to download.
 
-    base = <configured path>/<PatientID>          # must exist, or RuntimeError
-    path = base/<StudyInstanceUID>/<SeriesInstanceUID>
+Layout is fixed by `pylidc.Scan.get_path_to_dicom_files`:
 
-falling back to a recursive walk under `base` that matches on DICOM headers. So
-files are written to exactly that nested path.
-
-Annotations are NOT downloaded: pylidc ships them in its own 25 MB SQLite
-database (1,018 scans, 6,859 annotations, 41,406 contours). Only pixel data is
-missing, and that is what this fetches.
+    <root>/<PatientID>/<StudyInstanceUID>/<SeriesInstanceUID>/*.dcm
 
     python scripts/fetch_lidc.py --batch 2 --out /kaggle/working/lidc_dicom
 """
@@ -30,35 +28,30 @@ from pathlib import Path
 import requests
 from tqdm.auto import tqdm
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from medlift3d.compat import import_pylidc
+
 NBIA = "https://services.cancerimagingarchive.net/nbia-api/services/v1"
-NEEDED = ("SeriesInstanceUID", "StudyInstanceUID", "PatientID")
 
 
-def list_series(collection: str, modality: str, timeout: float = 120) -> list[dict]:
-    r = requests.get(f"{NBIA}/getSeries",
-                     params={"Collection": collection, "Modality": modality},
-                     timeout=timeout)
-    r.raise_for_status()
-    series = r.json()
-    if not series:
-        raise SystemExit(f"getSeries returned nothing for {collection}/{modality}")
-    missing = [k for k in NEEDED if k not in series[0]]
-    if missing:
-        raise SystemExit(f"getSeries did not return {missing}; got "
-                         f"{sorted(series[0])}")
-    return series
+def select_scans(pl, limit: int, skip: int, max_slice_thickness: float):
+    """The same query prepare_lidc.py runs, so the two cannot diverge."""
+    scans = pl.query(pl.Scan).filter(pl.Scan.slice_thickness <= max_slice_thickness)
+    return list(scans[skip:skip + limit])
 
 
-def series_dir(root: Path, meta: dict) -> Path:
-    return root / meta["PatientID"] / meta["StudyInstanceUID"] / meta["SeriesInstanceUID"]
+def series_dir(root: Path, scan) -> Path:
+    return root / scan.patient_id / scan.study_instance_uid / scan.series_instance_uid
 
 
-def download_series(meta: dict, root: Path, timeout: float = 300) -> Path:
-    dest = series_dir(root, meta)
+def download_series(scan, root: Path, timeout: float = 300) -> Path:
+    dest = series_dir(root, scan)
     dest.mkdir(parents=True, exist_ok=True)
     zpath = dest / "_series.zip"
     with requests.get(f"{NBIA}/getImage",
-                      params={"SeriesInstanceUID": meta["SeriesInstanceUID"]},
+                      params={"SeriesInstanceUID": scan.series_instance_uid},
                       stream=True, timeout=timeout) as r:
         r.raise_for_status()
         with open(zpath, "wb") as out:
@@ -81,50 +74,57 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=Path("/kaggle/working/lidc_dicom"))
     ap.add_argument("--batch", type=int, default=2,
-                    help="series to fetch this run (~43 s each)")
+                    help="scans to fetch this run (a few minutes each)")
     ap.add_argument("--skip", type=int, default=0,
-                    help="skip this many series first, to fetch a later slice")
-    ap.add_argument("--collection", default="LIDC-IDRI")
-    ap.add_argument("--modality", default="CT")
-    ap.add_argument("--no-pylidcrc", action="store_true",
-                    help="do not write ~/.pylidcrc")
+                    help="skip this many scans first; pass the same value to "
+                         "prepare_lidc.py --skip so both see the same set")
+    ap.add_argument("--max-slice-thickness", type=float, default=1.5,
+                    help="must match prepare_lidc.py, or the two disagree on "
+                         "which scans they are working with")
+    ap.add_argument("--no-pylidcrc", action="store_true")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
-    series = list_series(args.collection, args.modality)
-    print(f"{len(series)} {args.modality} series in {args.collection}")
+    if not args.no_pylidcrc:
+        # Written before the query: pylidc needs a config file to exist even to
+        # answer questions about scans whose images are not here yet.
+        print(f"wrote {write_pylidcrc(args.out)}")
 
-    chosen = series[args.skip:args.skip + args.batch]
-    print(f"fetching {len(chosen)} (skipping first {args.skip}) -> {args.out}")
+    pl = import_pylidc()
+    scans = select_scans(pl, args.batch, args.skip, args.max_slice_thickness)
+    if not scans:
+        raise SystemExit(f"no scans with slice_thickness <= "
+                         f"{args.max_slice_thickness} at offset {args.skip}")
+    print(f"{len(scans)} scan(s) selected (skip={args.skip}, "
+          f"slice_thickness <= {args.max_slice_thickness} mm):")
+    for s in scans:
+        print(f"  {s.patient_id}  {s.slice_thickness} mm")
 
     ok, failed = 0, []
-    for meta in tqdm(chosen, desc="series"):
-        dest = series_dir(args.out, meta)
+    for scan in tqdm(scans, desc="downloading"):
+        dest = series_dir(args.out, scan)
         if dest.exists() and any(dest.glob("*.dcm")):
             ok += 1
             continue
         try:
-            download_series(meta, args.out)
+            download_series(scan, args.out)
             ok += 1
         except Exception as e:                                      # noqa: BLE001
-            failed.append((meta["SeriesInstanceUID"], f"{type(e).__name__}: {e}"))
+            failed.append((scan.patient_id, f"{type(e).__name__}: {e}"))
 
-    print(f"\n{ok}/{len(chosen)} series present under {args.out}")
+    print(f"\n{ok}/{len(scans)} scans present under {args.out}")
     for p in sorted(args.out.glob("*/*/*"))[:3]:
         print(f"  {p.relative_to(args.out)}  ({len(list(p.glob('*.dcm')))} .dcm)")
     if failed:
         print(f"{len(failed)} failed, first: {failed[0]}")
-        print("A 403/404 means the public getImage endpoint changed or now "
-              "needs auth; check TCIA's REST API docs.")
-
-    if not args.no_pylidcrc:
-        print(f"wrote {write_pylidcrc(args.out)}:")
-        print("  " + (Path.home() / ".pylidcrc").read_text().replace("\n", "\n  "))
-
+        print("A 403/404 means TCIA's public getImage changed or now needs "
+              "auth; check their REST API docs.")
     if ok == 0:
         raise SystemExit("nothing downloaded")
-    patients = sorted(p.name for p in args.out.iterdir() if p.is_dir())
-    print(f"{len(patients)} patient folders, e.g. {patients[:3]}")
+
+    print(f"\nnow run:  python scripts/prepare_lidc.py --source pylidc "
+          f"--limit {args.batch} --skip {args.skip} "
+          f"--max-slice-thickness {args.max_slice_thickness} --device cuda")
 
 
 if __name__ == "__main__":

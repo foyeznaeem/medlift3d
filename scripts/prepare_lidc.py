@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from medlift3d.compat import import_pylidc
 from medlift3d.datasets import (default_dirs, geometry_to_dict, make_split,
                                 save_case, save_split, simulate, verify_split)
 from medlift3d.geometry import CHEST, Grid
@@ -80,47 +81,13 @@ def grid_from_sitk(image) -> tuple[Grid, np.ndarray]:
     return grid, arr
 
 
-def _patch_pylidc_deps():
-    """Restore the APIs pylidc needs but Python and NumPy have since removed.
-
-    pylidc was last released in 2020 and calls several names that have since
-    gone away. Found by grepping the installed package, so this is the complete
-    set rather than whichever one happened to raise first:
-
-      configparser.SafeConfigParser   Scan.py            (removed in Python 3.12)
-      np.int                          Contour.to_matrix, Annotation.bbox
-      np.float                        utils, Annotation diameter/volume
-      np.bool                         Annotation.boolean_mask   (all NumPy 1.24)
-
-    All of them were deprecated aliases of builtins, so aliasing them back is
-    exactly what the code expects and changes no behaviour.
-    """
-    import configparser
-    if not hasattr(configparser, "SafeConfigParser"):
-        configparser.SafeConfigParser = configparser.ConfigParser
-
-    # Exactly the three the grep found. Checking for np.object or np.str would
-    # itself raise a FutureWarning, and pylidc does not use them.
-    import numpy as _np
-    for name, builtin in (("int", int), ("float", float), ("bool", bool)):
-        if not hasattr(_np, name):
-            setattr(_np, name, builtin)
-
-
-def iter_pylidc(limit, max_slice_thickness):
-    _patch_pylidc_deps()
-
-    try:
-        import pylidc as pl
-    except ModuleNotFoundError as e:
-        raise SystemExit(
-            "pylidc is not installed, and --source pylidc needs it: it ships "
-            "the nodule annotations (1,018 scans, 6,859 readings, 41,406 "
-            "contours) that become the ground-truth masks.\n"
-            "    pip install pylidc"
-        ) from e
+def iter_pylidc(limit, max_slice_thickness, skip=0):
+    pl = import_pylidc()
     scans = pl.query(pl.Scan).filter(pl.Scan.slice_thickness <= max_slice_thickness)
-    for scan in scans.limit(limit) if limit else scans:
+    # Same slice as fetch_lidc.py took, so we ask for the scans that were
+    # actually downloaded rather than the first N of the unsliced query.
+    selected = scans[skip:skip + limit] if limit else list(scans)[skip:]
+    for scan in selected:
         try:
             vol = scan.to_volume().astype(np.float32)           # (y, x, z) HU
         except Exception as e:                                  # noqa: BLE001
@@ -186,6 +153,9 @@ def main():
     ap.add_argument("--in", dest="in_dir", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=d["data"] / "lidc")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--skip", type=int, default=0,
+                    help="skip this many scans first; must match "
+                         "fetch_lidc.py --skip")
     ap.add_argument("--max-slice-thickness", type=float, default=1.5,
                     help="mm; LIDC ranges 0.6-3.0 and thick slices make "
                          "volumetry ground truth unreliable")
@@ -198,7 +168,9 @@ def main():
     ap.add_argument("--det-spacing", type=float, default=None)
     ap.add_argument("--i0", type=float, default=1e5)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--device", default="cuda",
+                    help="projection simulation runs here; on CPU it "
+                         "dominates the runtime (minutes per case)")
     args = ap.parse_args()
 
     if args.source == "dir" and args.in_dir is None:
@@ -217,7 +189,8 @@ def main():
               f"det={g.det_shape}")
 
     args.out.mkdir(parents=True, exist_ok=True)
-    it = (iter_pylidc(args.limit, args.max_slice_thickness) if args.source == "pylidc"
+    it = (iter_pylidc(args.limit, args.max_slice_thickness, args.skip)
+          if args.source == "pylidc"
           else iter_dir(args.in_dir, args.limit, args.max_slice_thickness))
 
     ids, n_with_masks = [], 0
@@ -252,8 +225,16 @@ def main():
     if not ids:
         raise SystemExit("no cases ingested")
     split = make_split(ids, seed=args.seed)
-    verify_split(split)
     save_split(args.out / "splits.csv", split)
+    try:
+        verify_split(split)
+    except AssertionError:
+        # Writing the cases is the expensive part and they are fine; a handful
+        # cannot be split three ways, which only matters once you train.
+        if len(ids) >= 3:
+            raise
+        print(f"\nNOTE: {len(ids)} case(s) cannot fill train/val/test. The "
+              f"cases are written and usable, but fetch more before training.")
     write_json(args.out / "dataset.json", {
         "grid": dst.as_dict(), "source": args.source, "n_cases": len(ids),
         "n_with_nodule_masks": n_with_masks,
