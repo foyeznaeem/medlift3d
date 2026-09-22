@@ -89,7 +89,15 @@ def iter_pylidc(limit, max_slice_thickness):
     if not hasattr(configparser, "SafeConfigParser"):
         configparser.SafeConfigParser = configparser.ConfigParser
 
-    import pylidc as pl
+    try:
+        import pylidc as pl
+    except ModuleNotFoundError as e:
+        raise SystemExit(
+            "pylidc is not installed, and --source pylidc needs it: it ships "
+            "the nodule annotations (1,018 scans, 6,859 readings, 41,406 "
+            "contours) that become the ground-truth masks.\n"
+            "    pip install pylidc"
+        ) from e
     scans = pl.query(pl.Scan).filter(pl.Scan.slice_thickness <= max_slice_thickness)
     for scan in scans.limit(limit) if limit else scans:
         try:
