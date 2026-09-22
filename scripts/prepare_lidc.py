@@ -252,16 +252,23 @@ def main():
 
     if not ids:
         raise SystemExit("no cases ingested")
-    split = make_split(ids, seed=args.seed)
+    # Split over every case in the output directory, not just the ones this
+    # run added. Ingesting in batches is the norm (disk is the constraint, not
+    # time), and splitting per-run would leave splits.csv describing only the
+    # last batch while the earlier cases sat on disk, invisible to training.
+    all_ids = sorted(p.stem for p in args.out.glob("*.npz"))
+    if len(all_ids) > len(ids):
+        print(f"({len(ids)} new this run, {len(all_ids)} total on disk)")
+    split = make_split(all_ids, seed=args.seed)
     save_split(args.out / "splits.csv", split)
     try:
         verify_split(split)
     except AssertionError:
         # Writing the cases is the expensive part and they are fine; a handful
         # cannot be split three ways, which only matters once you train.
-        if len(ids) >= 3:
+        if len(all_ids) >= 3:
             raise
-        print(f"\nNOTE: {len(ids)} case(s) cannot fill train/val/test. The "
+        print(f"\nNOTE: {len(all_ids)} case(s) cannot fill train/val/test. The "
               f"cases are written and usable, but fetch more before training.")
     write_json(args.out / "dataset.json", {
         "grid": dst.as_dict(), "source": args.source, "n_cases": len(ids),
