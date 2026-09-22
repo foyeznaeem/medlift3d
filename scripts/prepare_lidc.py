@@ -81,8 +81,36 @@ def grid_from_sitk(image) -> tuple[Grid, np.ndarray]:
     return grid, arr
 
 
+def _check_dicom_path():
+    """Verify pylidc's configured DICOM directory before iterating scans.
+
+    pylidc reports a *missing directory* as "Could not establish path to dicom
+    files. Have you specified the `path` option...", which sends you to inspect
+    a config file that is usually correct -- and it does so once per scan. Check
+    it plainly, once, and say which of the two things is actually wrong.
+    """
+    import configparser
+    rc = Path.home() / ".pylidcrc"
+    cfg = configparser.ConfigParser()
+    if rc.exists():
+        cfg.read(rc)
+    dicom_path = cfg.get("dicom", "path", fallback="")
+    if not dicom_path:
+        raise SystemExit(
+            f"pylidc has no DICOM path configured ({rc} is missing or has no "
+            f"[dicom] path).\n"
+            f"Run scripts/fetch_lidc.py first; it writes this config.")
+    if not Path(dicom_path).is_dir():
+        raise SystemExit(
+            f"pylidc's DICOM path does not exist: {dicom_path}\n"
+            f"(configured in {rc}; the config is fine, the directory is gone)\n"
+            f"Run scripts/fetch_lidc.py to download the scans again.")
+    return Path(dicom_path)
+
+
 def iter_pylidc(limit, max_slice_thickness, skip=0):
     pl = import_pylidc()
+    _check_dicom_path()
     scans = pl.query(pl.Scan).filter(pl.Scan.slice_thickness <= max_slice_thickness)
     # Same slice as fetch_lidc.py took, so we ask for the scans that were
     # actually downloaded rather than the first N of the unsliced query.
