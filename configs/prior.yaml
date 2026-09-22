@@ -26,7 +26,8 @@ diffusion:
 
 train:
   epochs: 60
-  batch_size: 8               # ~7 GB at 256x256 with AMP on a T4
+  batch_size: 4               # slices per forward pass; 8 needs >15 GB
+  grad_accum: 2               # effective batch 8, about half the peak VRAM
   lr: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0

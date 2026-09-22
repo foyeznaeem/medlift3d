@@ -64,7 +64,13 @@ def main():
     ap.add_argument("--data", type=Path, default=d["data"] / "phantom")
     ap.add_argument("--out", type=Path, default=d["out"] / "prior")
     ap.add_argument("--epochs", type=int, default=60)
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=4,
+                    help="slices per forward pass; this is what costs VRAM. "
+                         "8 at 256x256 needs >15 GB and OOMs a T4")
+    ap.add_argument("--grad-accum", type=int, default=2,
+                    help="accumulate this many batches before stepping, so the "
+                         "effective batch is batch-size * grad-accum without "
+                         "the memory of one big batch")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--base-dim", type=int, default=64)
     ap.add_argument("--dim-mults", type=int, nargs="*", default=[1, 2, 4, 8])
@@ -96,6 +102,8 @@ def main():
     tr = SliceDataset(args.data, split["train"], cond_key=args.cond_key)
     va = SliceDataset(args.data, split["val"], cond_key=args.cond_key)
     cache_gb = (tr.cache_bytes + va.cache_bytes) / 2 ** 30
+    print(f"batch {args.batch_size} x {args.grad_accum} accum "
+          f"= effective {args.batch_size * args.grad_accum}")
     print(f"device={device} amp={use_amp}  train slices={len(tr)}  val slices={len(va)}"
           + (f"  slice cache {cache_gb:.2f} GB" if cache_gb else "  (uncached)"))
     print(f"train cases={len(split['train'])} val={len(split['val'])} "
@@ -144,21 +152,31 @@ def main():
         diff.train()
         bar = tqdm(dl_tr, desc=f"epoch {epoch+1}/{args.epochs}")
         run, seen = 0.0, 0
-        for batch in bar:
+        opt.zero_grad(set_to_none=True)
+        for micro, batch in enumerate(bar, start=1):
             x = batch["x"].to(device, non_blocking=True)
             cond = batch["cond"].to(device, non_blocking=True) if "cond" in batch else None
-            opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type, enabled=use_amp):
-                loss = diff.loss(x, cond)
+                # Divided so the accumulated gradient equals what one pass over
+                # batch_size * grad_accum samples would have produced.
+                loss = diff.loss(x, cond) / args.grad_accum
             scaler.scale(loss).backward()
+
+            # `seen` counts micro-batches and `run` sums undivided losses, so
+            # run/seen stays the mean loss per slice whatever grad_accum is.
+            seen += 1
+            run += float(loss.detach()) * args.grad_accum
+
+            if micro % args.grad_accum:
+                continue                      # keep accumulating, do not step
+
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(diff.model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
+            opt.zero_grad(set_to_none=True)
 
             step += 1
-            seen += 1
-            run += float(loss.detach())
             bar.set_postfix(loss=f"{run/seen:.4f}", step=step)
             if step % args.save_every == 0:
                 checkpoint(epoch)
